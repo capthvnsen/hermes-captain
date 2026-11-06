@@ -1,0 +1,12 @@
+name: hermes-captain
+version: "0.1.0"
+description: "Command Claude, Codex, Orca, and T3 Code from a remote Hermes. One tool surface, verified commands, no approval-bypass flags."
+author: Alex
+license: MIT
+requires_hermes: ">=0.22.0"
+provides_tools:
+  - captain_doctor
+  - captain_run
+  - captain_read
+  - captain_steer
+  - captain_stop
