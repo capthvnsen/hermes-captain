@@ -222,12 +222,12 @@ class Captain:
         for _ in range(24):
             plan = plan_wait(record["handle"], host=host, timeout=600)
             result = self.capture(plan.argv, None, 620)
-            outcome = _wait_outcome(result.get("stdout") or "")
+            outcome = _wait_outcome(result.get("stdout") or "") or _wait_outcome(result.get("stderr") or "")
             if outcome == "completed":
                 return "done"
             if outcome == "needs-attention":
                 return "needs-attention"
-            if outcome == "timeout" or result.get("code") == 124:
+            if outcome == "timeout" or result.get("code") in (6, 124):
                 continue
             if result.get("code") == 0 and not outcome:
                 return "done"
@@ -364,7 +364,12 @@ def _wait_outcome(stdout: str) -> str:
                 walk(value)
 
     walk(data)
-    return found[0] if found else ""
+    if found:
+        return found[0]
+    error = data.get("error") if isinstance(data, dict) else None
+    if isinstance(error, dict) and error.get("code") == "THREAD_WAIT_TIMEOUT":
+        return "timeout"
+    return ""
 
 
 def _clip(text: str) -> str:

@@ -460,6 +460,40 @@ def test_real_t3_thread_ids_are_accepted():
     assert plan.argv[plan.argv.index("--thread") + 1] == handle
 
 
+def test_t3_timeout_on_stderr_keeps_waiting():
+    import tempfile
+    calls = {"n": 0}
+
+    def capture(argv, cwd, timeout):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {
+                "code": 6,
+                "stdout": "",
+                "stderr": json.dumps({"ok": False, "error": {"code": "THREAD_WAIT_TIMEOUT"}}),
+            }
+        return {
+            "code": 0,
+            "stdout": json.dumps({"data": {"wait": {"outcome": "completed"}}}),
+            "stderr": "",
+        }
+
+    notes = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        captain = Captain(root, capture=capture)
+        captain.notify = lambda run_id, record: notes.append(record.get("ping"))
+        (root / "abc.json").write_text(json.dumps({
+            "id": "abc", "surface": "t3", "handle": "mcp:79982033-5d61-4be6-9794-8f203010edca",
+            "status": "running", "keep": False, "title": "Lane 4",
+        }), encoding="utf-8")
+        captain.arm_wait("abc")
+        done = captain.wait_done("abc", timeout=8)
+    assert calls["n"] == 2
+    assert done["ping"] == "done"
+    assert notes == ["done"]
+
+
 if __name__ == "__main__":
     import traceback
     failed = 0
