@@ -172,7 +172,7 @@ def plan_steer(agent: str, handle: str, prompt: str, *, host: str | None = None)
         raise PlanError("steer needs a handle and a prompt")
     if agent not in {"t3", "t3code"}:
         raise PlanError("steer is wired for T3 threads; start another run for claude, codex, or orca")
-    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,120}", handle):
+    if not re.fullmatch(r"[A-Za-z0-9_.:%-]{1,400}", handle):
         raise PlanError("thread id has unexpected characters")
     argv = [
         "t3code", "--json", "threads", "send",
@@ -188,7 +188,7 @@ def plan_stop(agent: str, handle: str, *, host: str | None = None) -> Plan | Non
     agent = (agent or "").strip().lower()
     handle = (handle or "").strip()
     if agent in {"t3", "t3code"} and handle:
-        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,120}", handle):
+        if not re.fullmatch(r"[A-Za-z0-9_.:%-]{1,400}", handle):
             raise PlanError("thread id has unexpected characters")
         argv = ["t3code", "threads", "interrupt", "--thread", handle]
         return Plan("t3", _host_prefix(host, None, argv), "capture", None, "t3code threads interrupt")
@@ -200,7 +200,7 @@ def plan_read(agent: str, handle: str, *, host: str | None = None) -> Plan | Non
     handle = (handle or "").strip()
     if agent not in {"t3", "t3code"} or not handle:
         return None
-    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,120}", handle):
+    if not re.fullmatch(r"[A-Za-z0-9_.:%-]{1,400}", handle):
         raise PlanError("thread id has unexpected characters")
     argv = [
         "t3code", "--json", "threads", "read",
@@ -214,7 +214,7 @@ def plan_read(agent: str, handle: str, *, host: str | None = None) -> Plan | Non
 
 def plan_inspect(handle: str, *, host: str | None = None) -> Plan:
     handle = (handle or "").strip()
-    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,120}", handle):
+    if not re.fullmatch(r"[A-Za-z0-9_.:%-]{1,400}", handle):
         raise PlanError("thread id has unexpected characters")
     argv = ["t3code", "--json", "threads", "inspect", "--thread", handle]
     return Plan("t3", _host_prefix(host, None, argv), "capture", None, "t3code threads inspect")
@@ -222,7 +222,7 @@ def plan_inspect(handle: str, *, host: str | None = None) -> Plan:
 
 def plan_wait(handle: str, *, host: str | None = None, timeout: int = 600) -> Plan:
     handle = (handle or "").strip()
-    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,120}", handle):
+    if not re.fullmatch(r"[A-Za-z0-9_.:%-]{1,400}", handle):
         raise PlanError("thread id has unexpected characters")
     seconds = max(1, min(int(timeout), 3600))
     argv = [
@@ -233,3 +233,8 @@ def plan_wait(handle: str, *, host: str | None = None, timeout: int = 600) -> Pl
         "--max-chars", "1500",
     ]
     return Plan("t3", _host_prefix(host, None, argv), "capture", None, "t3code threads wait, no model")
+
+
+def plan_list(host: str | None = None) -> Plan:
+    argv = ["t3code", "--json", "threads", "list"]
+    return Plan("t3", _host_prefix(host, None, argv), "capture", None, "t3code threads list")

@@ -18,7 +18,7 @@ sys.modules["hermes_captain"] = pkg
 importlib.import_module("hermes_captain.plan")
 importlib.import_module("hermes_captain.runner")
 
-from hermes_captain.plan import PlanError, plan_run, plan_steer  # noqa: E402
+from hermes_captain.plan import PlanError, plan_run, plan_steer, plan_wait  # noqa: E402
 from hermes_captain.runner import Captain  # noqa: E402
 
 BANNED = (
@@ -432,6 +432,32 @@ def test_finished_keep_pings_once():
         done = captain.wait_done("abc", timeout=8)
     assert done["ping"] == "done"
     assert notes == [("abc", True)]
+
+
+def test_finish_pings_without_being_asked():
+    import tempfile
+    from hermes_captain.runner import _spawn
+    notes = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        captain = Captain(root)
+        captain.notify = lambda run_id, record: notes.append(record.get("ping"))
+        log = root / "done.log"
+        pid = _spawn(["python3", "-c", ""], None, log)
+        captain._procs[pid] = getattr(_spawn, "_last", None)
+        (root / "abc.json").write_text(json.dumps({
+            "id": "abc", "pid": pid, "surface": "cli", "status": "running", "keep": False, "title": "beta",
+        }), encoding="utf-8")
+        captain.arm_wait("abc")
+        done = captain.wait_done("abc", timeout=8)
+    assert done["ping"] == "done"
+    assert notes == ["done"]
+
+
+def test_real_t3_thread_ids_are_accepted():
+    handle = "thread:delegated-task:command%3Amcp%3A58968731-a581-4993-8fff-3cb51a5a132e%3Adelegate-task%3A2490cc31"
+    plan = plan_wait(handle)
+    assert plan.argv[plan.argv.index("--thread") + 1] == handle
 
 
 if __name__ == "__main__":

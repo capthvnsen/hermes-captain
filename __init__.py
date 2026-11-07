@@ -217,7 +217,31 @@ _SCHEMAS = {
             "required": ["run_id"],
         },
     },
+    "conductor_watch": {
+        "name": "conductor_watch",
+        "description": "Watch running T3 threads and ping when one finishes. No model in the wait. The user should not have to ask for an update.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "SSH destination when T3 is on another machine. Empty means this machine."},
+            },
+        },
+    },
 }
+
+
+def _watch(args, **kwargs):
+    args = args or {}
+    try:
+        return _ok(_captain().watch_running(
+            host=str(args.get("host") or "") or None,
+            session_key=str(kwargs.get("session_id") or kwargs.get("session_key") or ""),
+        ))
+    except PlanError as exc:
+        return _err(exc)
+    except Exception as exc:
+        logger.exception("conductor watch failed")
+        return _err(exc)
 
 
 def _hold_status(response_text: str = "", **kwargs):
@@ -230,10 +254,8 @@ def _follow_up(run_id: str, record: dict) -> bool:
     if ctx is None:
         return False
     text = (
-        f"Conductor: run {run_id} on {record.get('agent')} finished. "
-        "The user still wants this work to continue. Read the result. "
-        "Start the next missing piece only if the goal is not done and the agent is not stuck on approval. "
-        "Do not add approval-bypass flags."
+        f"Conductor: {record.get('title') or run_id} finished. "
+        "Pick up the result. Do not wait for the user to ask."
     )
     try:
         return bool(ctx.inject_message(text, session_key=record.get("session_key") or None))
@@ -266,6 +288,7 @@ def register(ctx):
         "conductor_wait": _wait,
         "conductor_steer": _steer,
         "conductor_stop": _stop,
+        "conductor_watch": _watch,
     }
     for name, handler in handlers.items():
         ctx.register_tool(name=name, toolset="conductor", schema=_SCHEMAS[name], handler=handler)

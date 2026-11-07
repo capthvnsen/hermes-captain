@@ -13,7 +13,18 @@ import uuid
 from pathlib import Path
 
 from .peek import approval_stuck, build_card, git_stat, hold_reply, t3_pending
-from .plan import HOST_RE, PlanError, plan_inspect, plan_read, plan_run, plan_steer, plan_stop, plan_wait, ssh_argv
+from .plan import (
+    HOST_RE,
+    PlanError,
+    plan_inspect,
+    plan_list,
+    plan_read,
+    plan_run,
+    plan_steer,
+    plan_stop,
+    plan_wait,
+    ssh_argv,
+)
 
 MAX_READ = 8000
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -158,6 +169,71 @@ class Captain:
         self._waits[run_id] = thread
         return {"ok": True, "waiting": True, "model": False}
 
+    def watch_running(self, host: str | None = None, session_key: str = "") -> dict:
+        """Arm a no-model wait on every running T3 thread. Ping when one finishes."""
+        plan = plan_list(host)
+        result = self.capture(plan.argv, None, 30)
+        if result.get("code") != 0:
+            return {"ok": False, "error": result.get("error") or "could not list threads", "watched": []}
+        try:
+            data = json.loads(result.get("stdout") or "{}")
+        except json.JSONDecodeError:
+            return {"ok": False, "error": "thread list was not json", "watched": []}
+        threads = (data.get("data") or {}).get("threads") or []
+        watching = self._open_handles()
+        watched = []
+        for thread in threads:
+            if thread.get("runStatus") != "running" and thread.get("activityRunStatus") != "running":
+                continue
+            handle = thread.get("id") or ""
+            if not handle or handle in watching:
+                continue
+            run_id = uuid.uuid4().hex[:12]
+            record = {
+                "id": run_id,
+                "agent": "t3",
+                "surface": "t3",
+                "handle": handle,
+                "host": host or "",
+                "title": thread.get("title") or "",
+                "status": "running",
+                "keep": False,
+            }
+            if session_key:
+                record["session_key"] = session_key
+            self._save(run_id, record)
+            self.arm_wait(run_id)
+            watched.append({"run_id": run_id, "title": record["title"]})
+        return {"ok": True, "watched": watched, "model": False}
+
+    def _open_handles(self) -> set[str]:
+        handles = set()
+        for path in self.data_dir.glob("*.json"):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if record.get("handle") and not record.get("pinged_at"):
+                handles.add(record["handle"])
+        return handles
+
+    def _wait_t3(self, record: dict) -> str:
+        host = record.get("host") or None
+        for _ in range(24):
+            plan = plan_wait(record["handle"], host=host, timeout=600)
+            result = self.capture(plan.argv, None, 620)
+            outcome = _wait_outcome(result.get("stdout") or "")
+            if outcome == "completed":
+                return "done"
+            if outcome == "needs-attention":
+                return "needs-attention"
+            if outcome == "timeout" or result.get("code") == 124:
+                continue
+            if result.get("code") == 0 and not outcome:
+                return "done"
+            return "wait failed"
+        return "wait failed"
+
     def wait_done(self, run_id: str, timeout: float = 30) -> dict:
         thread = self._waits.get(run_id)
         if thread is not None:
@@ -180,9 +256,7 @@ class Captain:
             return
         ping = "done"
         if record.get("surface") == "t3" and record.get("handle"):
-            plan = plan_wait(record["handle"], host=record.get("host") or None, timeout=600)
-            result = self.capture(plan.argv, None, 620)
-            ping = "done" if result.get("code") == 0 else "wait failed"
+            ping = self._wait_t3(record)
         else:
             pid = record.get("pid")
             proc = self._procs.get(int(pid)) if pid else None
@@ -201,7 +275,7 @@ class Captain:
         fresh["ping"] = ping
         fresh["pinged_at"] = time.time()
         self._save(run_id, fresh)
-        if fresh.get("keep") and ping == "done" and self.notify:
+        if ping in ("done", "needs-attention") and self.notify:
             try:
                 self.notify(run_id, fresh)
             except Exception:
@@ -269,6 +343,28 @@ class Captain:
         if not path.exists():
             raise PlanError(f"no run {run_id}")
         return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _wait_outcome(stdout: str) -> str:
+    try:
+        data = json.loads(stdout or "")
+    except json.JSONDecodeError:
+        return ""
+    found = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            wait = node.get("wait")
+            if isinstance(wait, dict) and isinstance(wait.get("outcome"), str):
+                found.append(wait["outcome"])
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(data)
+    return found[0] if found else ""
 
 
 def _clip(text: str) -> str:
