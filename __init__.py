@@ -5,12 +5,15 @@ from __future__ import annotations
 import json
 import logging
 
+from pathlib import Path
+
 from .plan import PlanError
 from .runner import Captain
 
 logger = logging.getLogger(__name__)
 
 _CAPTAIN: Captain | None = None
+_CTX = None
 
 
 def _captain() -> Captain:
@@ -39,7 +42,6 @@ def _doctor(args, **kwargs):
 
 
 def _run(args, **kwargs):
-    del kwargs
     args = args or {}
     try:
         record = _captain().run(
@@ -49,6 +51,13 @@ def _run(args, **kwargs):
             host=str(args.get("host") or "") or None,
             worker=str(args.get("worker") or "") or None,
             orca_host=str(args.get("orca_host") or "") or None,
+            provider=str(args.get("provider") or "") or None,
+            worktree=str(args.get("worktree") or "") or None,
+            prompt_flag=str(args.get("prompt_flag") or "") or None,
+            continue_session=bool(args.get("continue")),
+            keep=bool(args.get("keep")),
+            model=str(args.get("model") or "") or None,
+            session_key=str(kwargs.get("session_id") or kwargs.get("session_key") or ""),
         )
         return _ok({"run": record})
     except PlanError as exc:
@@ -62,6 +71,22 @@ def _read(args, **kwargs):
     del kwargs
     try:
         return _ok({"run": _captain().read(str((args or {}).get("run_id") or ""))})
+    except PlanError as exc:
+        return _err(exc)
+
+
+def _peek(args, **kwargs):
+    del kwargs
+    try:
+        return _ok({"card": _captain().peek(str((args or {}).get("run_id") or ""))})
+    except PlanError as exc:
+        return _err(exc)
+
+
+def _wait(args, **kwargs):
+    del kwargs
+    try:
+        return _ok(_captain().arm_wait(str((args or {}).get("run_id") or "")))
     except PlanError as exc:
         return _err(exc)
 
@@ -84,7 +109,24 @@ def _stop(args, **kwargs):
 
 
 def handle_command(raw_args: str) -> str:
-    host = (raw_args or "").strip() or None
+    raw = (raw_args or "").strip()
+    if raw.lower().startswith("peek"):
+        run_id = raw[4:].strip()
+        if not run_id:
+            return "Usage: /conductor peek <run_id>"
+        try:
+            card = _captain().peek(run_id)
+        except Exception as exc:
+            return str(exc)
+        if not card.get("speak"):
+            return "No change."
+        lines = [card.get("note") or card.get("status") or "changed"]
+        if card.get("stuck_on_approval"):
+            lines.append("stuck on approval")
+        if card.get("diff"):
+            lines.append(card["diff"])
+        return "\n".join(lines)
+    host = raw or None
     report = _captain().doctor(host)
     lines = [f"Captain on {report.get('host')}"]
     for name, present in (report.get("agents") or {}).items():
@@ -95,8 +137,8 @@ def handle_command(raw_args: str) -> str:
 
 
 _SCHEMAS = {
-    "captain_doctor": {
-        "name": "captain_doctor",
+    "conductor_doctor": {
+        "name": "conductor_doctor",
         "description": "See which coding agents Captain can reach on this machine or over SSH. Does not launch anything.",
         "parameters": {
             "type": "object",
@@ -105,24 +147,30 @@ _SCHEMAS = {
             },
         },
     },
-    "captain_run": {
-        "name": "captain_run",
-        "description": "Start a coding agent. claude and codex run in the background. orca and t3 hand the prompt to the running app and return. Never adds approval-bypass flags. T3 is launched approval-required.",
+    "conductor_run": {
+        "name": "conductor_run",
+        "description": "Start a coding agent. hermes, claude, codex, grok, opencode, and pycode are named recipes. Never adds approval-bypass flags. Pass keep only when the user wants the next task started after this one finishes.",
         "parameters": {
             "type": "object",
             "properties": {
-                "agent": {"type": "string", "description": "claude, codex, orca, or t3"},
+                "agent": {"type": "string", "description": "hermes, claude, codex, grok, opencode, pycode, orca, t3, or another terminal command name. Unknown commands need prompt_flag."},
+                "prompt_flag": {"type": "string", "description": "For an unknown terminal agent only: -p, --print, or --prompt. No other flags are accepted."},
                 "prompt": {"type": "string", "description": "The task to hand off."},
                 "cwd": {"type": "string", "description": "Absolute project directory. On a remote host it is passed as an argument, not a shell string."},
                 "host": {"type": "string", "description": "SSH destination when the agent is on another machine. Empty means this machine."},
                 "worker": {"type": "string", "description": "Orca only: which agent tab to launch. Defaults to claude."},
-                "orca_host": {"type": "string", "description": "Orca only: --host selector from orca host list, such as local or ssh:name."},
+                "orca_host": {"type": "string", "description": "Orca only: --environment selector, such as local. Empty means the machine the command runs on."},
+                "provider": {"type": "string", "description": "T3 only: provider instance id, such as claudeAgent. Empty uses T3's saved default."},
+                "worktree": {"type": "string", "description": "Orca only: worktree selector, such as path:/Users/alex/Projects/app. Required when more than one workspace matches."},
+                "continue": {"type": "boolean", "description": "Continue the last claude or grok session in this directory. Other agents refuse this."},
+                "keep": {"type": "boolean", "description": "When this run finishes, ping Hermes to give the next task. Only if the user still wants the work to continue."},
+                "model": {"type": "string", "description": "Plain model id for hermes, claude, or grok. Other agents refuse this. Not a price and not a bypass flag."},
             },
             "required": ["agent", "prompt"],
         },
     },
-    "captain_read": {
-        "name": "captain_read",
+    "conductor_read": {
+        "name": "conductor_read",
         "description": "Read the latest output of a Captain run. For T3 this asks the thread. For CLI runs it tails the local log.",
         "parameters": {
             "type": "object",
@@ -130,8 +178,26 @@ _SCHEMAS = {
             "required": ["run_id"],
         },
     },
-    "captain_steer": {
-        "name": "captain_steer",
+    "conductor_peek": {
+        "name": "conductor_peek",
+        "description": "Check a run without dumping the log. Returns speak false when nothing changed, so the lead model stays quiet. Includes a stuck-on-approval flag and a short diff stat when something did change.",
+        "parameters": {
+            "type": "object",
+            "properties": {"run_id": {"type": "string"}},
+            "required": ["run_id"],
+        },
+    },
+    "conductor_wait": {
+        "name": "conductor_wait",
+        "description": "Wait for a run to finish and ping when it does. No model call. A 15-minute check-in is slower.",
+        "parameters": {
+            "type": "object",
+            "properties": {"run_id": {"type": "string"}},
+            "required": ["run_id"],
+        },
+    },
+    "conductor_steer": {
+        "name": "conductor_steer",
         "description": "Send a follow-up into a T3 thread with --if-busy steer. Claude, Codex, and Orca runs are one-shot; start another run instead.",
         "parameters": {
             "type": "object",
@@ -142,8 +208,8 @@ _SCHEMAS = {
             "required": ["run_id", "prompt"],
         },
     },
-    "captain_stop": {
-        "name": "captain_stop",
+    "conductor_stop": {
+        "name": "conductor_stop",
         "description": "Stop a local CLI run, or interrupt a T3 thread. Orca launches have no verified stop command yet.",
         "parameters": {
             "type": "object",
@@ -154,19 +220,52 @@ _SCHEMAS = {
 }
 
 
-def register(ctx):
-    ctx.register_command(
-        "captain",
-        handle_command,
-        description="Show which coding agents Captain can reach.",
-        args_hint="[ssh-host]",
+def _hold_status(response_text: str = "", **kwargs):
+    del kwargs
+    return _captain().hold_status_reply(response_text)
+
+
+def _follow_up(run_id: str, record: dict) -> bool:
+    ctx = _CTX
+    if ctx is None:
+        return False
+    text = (
+        f"Conductor: run {run_id} on {record.get('agent')} finished. "
+        "The user still wants this work to continue. Read the result. "
+        "Start the next missing piece only if the goal is not done and the agent is not stuck on approval. "
+        "Do not add approval-bypass flags."
     )
+    try:
+        return bool(ctx.inject_message(text, session_key=record.get("session_key") or None))
+    except Exception:
+        logger.exception("conductor follow-up failed")
+        return False
+
+
+def register(ctx):
+    global _CTX
+    _CTX = ctx
+    _captain().notify = _follow_up
+    ctx.register_skill(
+        "lead",
+        Path(__file__).resolve().parent / "skills" / "lead" / "SKILL.md",
+        description="Use when leading coding agents. Prompts them and follows up.",
+    )
+    ctx.register_command(
+        "conductor",
+        handle_command,
+        description="Show which coding agents Conductor can reach. /conductor peek <run_id> checks a run without a model.",
+        args_hint="[ssh-host | peek <run_id>]",
+    )
+    ctx.register_hook("transform_llm_output", _hold_status, hold_stream=True)
     handlers = {
-        "captain_doctor": _doctor,
-        "captain_run": _run,
-        "captain_read": _read,
-        "captain_steer": _steer,
-        "captain_stop": _stop,
+        "conductor_doctor": _doctor,
+        "conductor_run": _run,
+        "conductor_read": _read,
+        "conductor_peek": _peek,
+        "conductor_wait": _wait,
+        "conductor_steer": _steer,
+        "conductor_stop": _stop,
     }
     for name, handler in handlers.items():
-        ctx.register_tool(name=name, toolset="hermes-captain", schema=_SCHEMAS[name], handler=handler)
+        ctx.register_tool(name=name, toolset="conductor", schema=_SCHEMAS[name], handler=handler)
