@@ -1,4 +1,4 @@
-"""Hermes Captain — one surface for the coding agents a remote Hermes has to drive."""
+"""Conductor — start a coding agent, wait, then peek."""
 
 from __future__ import annotations
 
@@ -128,7 +128,7 @@ def handle_command(raw_args: str) -> str:
         return "\n".join(lines)
     host = raw or None
     report = _captain().doctor(host)
-    lines = [f"Captain on {report.get('host')}"]
+    lines = [f"Conductor on {report.get('host')}"]
     for name, present in (report.get("agents") or {}).items():
         lines.append(f"{name}: {'ready' if present else 'missing'}")
     if report.get("error"):
@@ -139,7 +139,7 @@ def handle_command(raw_args: str) -> str:
 _SCHEMAS = {
     "conductor_doctor": {
         "name": "conductor_doctor",
-        "description": "See which coding agents Captain can reach on this machine or over SSH. Does not launch anything.",
+        "description": "See which coding agents Conductor can reach on this machine or over SSH. Does not launch anything.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -171,7 +171,7 @@ _SCHEMAS = {
     },
     "conductor_read": {
         "name": "conductor_read",
-        "description": "Read the latest output of a Captain run. For T3 this asks the thread. For CLI runs it tails the local log.",
+        "description": "Read the latest output of a Conductor run. For T3 this asks the thread. For CLI runs it tails the local log.",
         "parameters": {
             "type": "object",
             "properties": {"run_id": {"type": "string"}},

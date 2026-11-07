@@ -2,7 +2,7 @@
 
 Conductor starts a coding agent and waits until it finishes. Hermes gets one ping. No model sits in the wait.
 
-It can start Hermes, Claude Code, Codex, Grok Build, OpenCode, and Pycode. Claude and Grok can continue their last session. An unknown terminal command needs `-p`, `--print`, or `--prompt`. No other flags.
+It starts Claude in T3, waits, and peeks. A second peek stays quiet. It can also start Hermes, Claude Code, Codex, Grok Build, OpenCode, and Pycode. Claude and Grok can continue their last session. An unknown terminal command needs `-p`, `--print`, or `--prompt`. No other flags.
 
 ## Install
 
