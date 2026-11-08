@@ -23,6 +23,7 @@ from .peek import (
     git_stat,
     hold_reply,
     idle_seconds,
+    reset_time,
     run_health,
     t3_pending,
     t3_thread,
@@ -45,6 +46,7 @@ MAX_READ = 8000
 MAX_RESULT = 1500
 T3_POLL = 60  # seconds per T3 wait; the health check runs between waits
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+CARD_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 MODES = ("drive", "advise")
 MAX_ROUNDS = 5
 
@@ -67,6 +69,8 @@ class Captain:
         self.notify = None
         self.retry_delay = 5
         self.health_every = 30
+        self._kanban_threads: list[threading.Thread] = []
+        self._kanban_logged = False
         self._supervise_stop = threading.Event()
 
     def get_mode(self) -> str:
@@ -113,6 +117,9 @@ class Captain:
         session_key = str(kwargs.pop("session_key", "") or "")
         mode = kwargs.pop("mode", None)
         mode = _check_mode(mode) if mode else None
+        card = str(kwargs.pop("card", "") or "")
+        if card and not CARD_RE.fullmatch(card):
+            raise PlanError("card must be a plain task id")
         plan = plan_run(agent, prompt, **kwargs)
         run_id = uuid.uuid4().hex[:12]
         record = {
@@ -129,6 +136,8 @@ class Captain:
         }
         if session_key:
             record["session_key"] = session_key
+        if card:
+            record["card"] = card
         if mode:
             record["follow_mode"] = mode  # "mode" on the record is already the launch mode
         if plan.mode == "capture":
@@ -149,6 +158,7 @@ class Captain:
             record["pid_started"] = _proc_start(pid)
             record["log"] = str(log_path)
         self._save(run_id, record)
+        self._kanban(record, "comment", f"started: {record['agent']} {record['host'] or 'local'}")
         if record.get("pid") or (record.get("surface") == "t3" and record.get("handle")):
             self.arm_wait(run_id)
         return record
@@ -401,6 +411,10 @@ class Captain:
                 f"Conductor: {name}{where} is {word}: {why}. Tell the user this now, in one line. "
                 f"Check it with conductor_peek {run_id}. Do not steer it and do not start another run."
             )
+            if word == "needs-approval":
+                self._kanban(record, "block", why, "--kind", "needs_input")
+            else:
+                self._kanban(record, "comment", f"{word}: {why}")
             try:  # shortcut: a ping that fails to send is not retried; the finish ping still is
                 if self.notify:
                     self.notify(run_id, {**record, "message": message})
@@ -431,6 +445,8 @@ class Captain:
                 continue
             if record.get("follow_up") == "undelivered" and record.get("message"):
                 self._deliver(run_id, record)
+            elif record.get("resume_at") and not record.get("resumed_at") and time.time() >= record["resume_at"]:
+                self._nudge(run_id, record)
             elif record.get("pinged_at") or run_id in self._waits:
                 continue
             elif record.get("handle"):
@@ -446,6 +462,50 @@ class Captain:
                     self._save(run_id, record)
                     self._deliver(run_id, record)
 
+    def _nudge(self, run_id: str, record: dict) -> None:
+        """Once, after a usage limit should have reset: tell Hermes. Hermes sends the continue, never this plugin."""
+        name = record.get("title") or run_id
+        if record.get("surface") == "t3" and record.get("handle"):
+            go = f"conductor_steer on run {run_id}"
+        else:
+            go = f"conductor_run (agent {record.get('agent')}, continue true, cwd {record.get('cwd') or 'the same directory'})"
+        go += ": 'Continue where you left off.'"
+        head = f"Conductor: {name} hit a usage limit and it should have reset."
+        if (record.get("rounds") or 0) >= MAX_ROUNDS:
+            text = f"{head} Run {run_id} has used all {MAX_ROUNDS} follow-ups. Tell the user and wait. Do not call conductor_steer or conductor_run."
+        elif (record.get("follow_mode") or self.get_mode()) == "advise":
+            text = f"{head} Ask the user first whether to resume it with {go}"
+        else:
+            text = f"{head} Resume it with {go}"
+        try:
+            sent = bool(self.notify and self.notify(run_id, {**record, "message": text}))
+        except Exception:
+            sent = False
+        if sent:  # an unsent nudge is tried again on the next pass
+            record["resumed_at"] = time.time()
+            self._save(run_id, record)
+
+    def _kanban(self, record: dict, verb: str, text: str, *flags: str) -> None:
+        """Mirror an event onto the Hermes board. Off the wait's thread, never raises, never completes a card."""
+        card = record.get("card")
+        if not card:
+            return
+        argv = ["hermes", "kanban", verb, *flags, card, f"Conductor: {text}"]
+
+        def call() -> None:
+            try:
+                got = self.capture(argv, None, 20)
+                error = "" if got.get("code") == 0 else (got.get("error") or f"exit {got.get('code')}")
+            except Exception as exc:
+                error = str(exc) or type(exc).__name__
+            if error and not self._kanban_logged:
+                self._kanban_logged = True
+                logger.warning("conductor kanban %s failed: %s", verb, error)
+
+        thread = threading.Thread(target=call, daemon=True)
+        thread.start()
+        self._kanban_threads = [t for t in self._kanban_threads if t.is_alive()] + [thread]
+
     def _finish_message(self, record: dict, ping: str) -> str:
         name = record.get("title") or record.get("id")
         where = f" on {record['host']}" if record.get("host") else ""
@@ -455,7 +515,7 @@ class Captain:
                 f"Conductor: lost track of {name}{where} ({ping}). It may still be running. "
                 f"Tell the user this now. Check it once with conductor_peek {run_id}. Do not start another run."
             )
-        result, pending, failure = "", False, ""
+        result, pending, failure, lasterr = "", False, "", ""
         if record.get("surface") == "t3" and record.get("handle"):
             host = record.get("host") or None
             read = plan_read(record.get("agent") or "t3", record["handle"], host=host)
@@ -464,13 +524,16 @@ class Captain:
                 result = _answer_text(got.get("stdout") or "") if got.get("code") == 0 else ""
             inspect = self._inspect(record)
             pending = t3_pending(inspect)
-            failure = thread_failure(t3_thread(inspect)) or ("the thread run failed" if ping == "errored" else "")
+            thread = t3_thread(inspect)
+            lasterr = str(thread.get("lastError") or "")
+            failure = thread_failure(thread) or ("the thread run failed" if ping == "errored" else "")
         elif record.get("log") and Path(record["log"]).exists():
             result = Path(record["log"]).read_text(encoding="utf-8", errors="replace").strip()
         if len(result) > MAX_RESULT:
             result = f"[first {len(result) - MAX_RESULT} characters cut]\n{result[-MAX_RESULT:]}"
         result = result or "(the agent returned no answer text)"
         if pending or ping == "needs-attention":
+            self._kanban(record, "block", "waiting on an approval; approve it on that machine", "--kind", "needs_input")
             return (
                 f"Conductor: {name}{where} is waiting on you, probably an approval. "
                 f"Tell the user now that it needs their approval on that machine. What it last said:\n{result}\n"
@@ -478,11 +541,21 @@ class Captain:
             )
         reason = failure or error_reason(record.get("exit_code"), result)
         if reason:
+            again = ""
+            if any(error_reason(None, t) == "usage limit reached" for t in (lasterr, result)):
+                at = reset_time(lasterr) or reset_time(result)
+                if at:
+                    record["resume_at"] = at
+                    again = f" It should reset around {time.strftime('%H:%M', time.localtime(at))}."
+                else:
+                    again = " Reset time unknown."
+            self._kanban(record, "block", reason)
             return (
-                f"Conductor: {name}{where} errored: {reason} (run {run_id}). "
+                f"Conductor: {name}{where} errored: {reason} (run {run_id}).{again} "
                 f"Tell the user now, in one line. What it last said:\n{result}\n"
                 "Do not start another run to retry unless the user says so."
             )
+        self._kanban(record, "comment", result)
         mode = record.get("follow_mode") or self.get_mode()
         rounds = record.get("rounds") or 0
         if mode == "advise":

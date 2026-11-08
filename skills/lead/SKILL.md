@@ -19,4 +19,8 @@ Split work only when the pieces do not touch the same files. Use the cheaper ins
 
 When a run finishes, Conductor puts the result into this session. Message the user with that result, not just "done". Then follow the mode in that message. advise (the default): recommend one next step in one line and wait; do not call conductor_steer or conductor_run. drive: keep steering until done-when is met, at most 5 follow-ups per run, and stop at once on stalled, errored, needs-approval, or lost. Change the mode only when the user asks, with conductor_mode. Stop when the goal is met or the user says stop. If the agent is stuck on an approval, tell the user and wait: conductor_steer refuses, and do not start another run to get past it.
 
+Pass card (a Hermes kanban task id) to conductor_run and Conductor comments progress on it, and blocks it on an error or an approval. It never completes a card: you complete it, after you check the result.
+
+A usage limit with a reset time makes Conductor tell you once when it should have reset. In drive mode resume with conductor_steer 'Continue where you left off.' In advise mode ask the user first. Never past 5 follow-ups.
+
 A missing binary or a missing login is a missing login. Say which one.

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 QUIET_AFTER = 180
 STALLED_AFTER = 600
@@ -98,6 +100,30 @@ def error_reason(code: int | None, text: str) -> str:
     if any(marker in low for marker in LOGIN_MARKERS):
         return "login failed"
     return f"exited with code {code}" if code else ""
+
+
+RESET_IN = re.compile(r"(?:try again|resets?)\s+in\s+(\d+)\s*([hm])", re.I)
+RESET_AT = re.compile(r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\b(?:\s*\(([A-Za-z_+/-]+)\))?", re.I)
+
+
+def reset_time(text: str, now: float | None = None) -> float | None:
+    """When a usage limit lifts, from "resets 3:00 PM (America/Denver)" or "try again in 2 hours". None if unclear."""
+    now = now or time.time()
+    text = (text or "")[-500:]
+    m = RESET_IN.search(text)
+    if m:
+        return now + int(m[1]) * (3600 if m[2].lower() == "h" else 60)
+    m = RESET_AT.search(text)
+    if not m or not 1 <= int(m[1]) <= 12 or int(m[2] or 0) > 59:
+        return None
+    try:
+        zone = ZoneInfo(m[4]) if m[4] else None  # shortcut: no zone means this machine's, when the agent is elsewhere say so
+    except (KeyError, ValueError, OSError):
+        zone = None
+    at = datetime.fromtimestamp(now, zone).replace(hour=int(m[1]) % 12 + (12 if m[3].lower() == "p" else 0), minute=int(m[2] or 0), second=0, microsecond=0)
+    if at.timestamp() <= now:
+        at += timedelta(days=1)
+    return at.timestamp()
 
 
 def thread_failure(thread: dict) -> str:

@@ -61,6 +61,7 @@ def _run(args, **kwargs):
             keep=bool(args.get("keep")),
             model=str(args.get("model") or "") or None,
             mode=str(args.get("mode") or "") or None,
+            card=str(args.get("card") or "") or None,
             session_key=str(kwargs.get("session_id") or kwargs.get("session_key") or ""),
         )
         return _ok({"run": record})
@@ -188,6 +189,7 @@ _SCHEMAS = {
                 "continue": {"type": "boolean", "description": "Continue the last claude or grok session in this directory. Other agents refuse this."},
                 "keep": {"type": "boolean", "description": "When this run finishes, ping Hermes to give the next task. Only if the user still wants the work to continue."},
                 "model": {"type": "string", "description": "Plain model id for hermes, claude, or grok. Other agents refuse this. Not a price and not a bypass flag."},
+                "card": {"type": "string", "description": "Hermes kanban task id. Conductor comments progress on it and blocks it on an error or approval. It never completes it."},
                 "mode": {"type": "string", "enum": ["drive", "advise"], "description": "For this run only: overrides the saved mode. drive keeps steering until done; advise only recommends."},
             },
             "required": ["agent"],

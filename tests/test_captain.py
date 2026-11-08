@@ -1160,6 +1160,245 @@ def test_mode_tool_and_slash_command():
     assert ran["run"]["follow_mode"] == "drive" and bad["ok"] is False
 
 
+def _board(captain, fail=None, gate=None):
+    """Route hermes calls to a list instead of a real board. fail: 'raise' or 'code'. gate: an Event the call waits on."""
+    calls = []
+    real = captain.capture
+
+    def capture(argv, cwd, timeout):
+        if argv[0] != "hermes":
+            return real(argv, cwd, timeout)
+        calls.append(argv)
+        if gate is not None:
+            gate.wait(10)
+        if fail == "raise":
+            raise OSError("no hermes")
+        return {"code": 1 if fail == "code" else 0, "stdout": "", "error": "board down" if fail else ""}
+
+    captain.capture = capture
+    return calls
+
+
+def _board_run(thread=None, waits=(COMPLETED,), card="t_42", pending=False, **board):
+    """Wait out a T3 run. Returns (hermes argvs, messages sent, captain)."""
+    import tempfile
+    sent = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        captain, _ = _t3_captain(root, list(waits), pending=pending, thread=thread)
+        if card:
+            record = json.loads((root / "abc.json").read_text())
+            (root / "abc.json").write_text(json.dumps({**record, "card": card}), encoding="utf-8")
+        calls = _board(captain, **board)
+        captain.notify = lambda run_id, record: sent.append(record["message"]) or True
+        captain.arm_wait("abc")
+        captain.wait_done("abc", timeout=8)
+        for thread_ in captain._kanban_threads:
+            thread_.join(5)
+    return calls, sent, captain
+
+
+def test_card_gets_start_comment_stall_comment_and_the_answer():
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        captain = Captain(Path(tmp), capture=lambda *a: {"code": 0, "stdout": "{}", "error": ""})
+        calls = _board(captain)
+        captain.run("t3", "review", host=MAC, card="t_42")
+        for t in captain._kanban_threads:
+            t.join(5)
+    assert calls == [["hermes", "kanban", "comment", "t_42", f"Conductor: started: t3 {MAC}"]]
+    calls, sent, _ = _board_run(thread={"runStatus": "running", "updatedAt": _ago(15)}, waits=[TIMEOUT, TIMEOUT, COMPLETED])
+    verbs = [c[2] for c in calls]
+    assert verbs == ["comment", "comment"]
+    assert calls[0][3:] == ["t_42", "Conductor: stalled: no new output for 15 minutes"]
+    assert calls[1][3:] == ["t_42", f"Conductor: {ANSWER}"]
+
+
+def test_card_is_blocked_on_errored_and_on_approval_and_never_completed():
+    calls, _, _ = _board_run(thread={"runStatus": "failed", "lastError": "payment is past due"})
+    assert calls == [["hermes", "kanban", "block", "t_42", "Conductor: payment is past due"]]
+    every = list(calls)
+    calls, _, _ = _board_run(pending=True)
+    assert calls == [["hermes", "kanban", "block", "--kind", "needs_input", "t_42",
+                      "Conductor: waiting on an approval; approve it on that machine"]]
+    every += calls
+    calls, _, _ = _board_run(thread={"runStatus": "running", "updatedAt": _ago(15)}, waits=[TIMEOUT, COMPLETED])
+    every += calls
+    done, _, _ = _board_run()
+    every += done
+    assert len(every) >= 4
+    assert all(c[:2] == ["hermes", "kanban"] and c[2] in ("comment", "block") for c in every)
+    assert not any("complete" in part for c in every for part in c[:3])
+
+
+def test_no_card_means_no_kanban_calls():
+    import tempfile
+    for kwargs in (dict(thread={"runStatus": "failed"}), dict(pending=True), dict()):
+        calls, sent, _ = _board_run(card=None, **kwargs)
+        assert calls == [] and len(sent) == 1
+    with tempfile.TemporaryDirectory() as tmp:
+        captain = Captain(Path(tmp), capture=lambda *a: {"code": 0, "stdout": "{}", "error": ""})
+        calls = _board(captain)
+        captain.run("t3", "review")
+        for t in captain._kanban_threads:
+            t.join(2)
+        for bad in ("--evil", "a b", "x" * 80):
+            try:
+                captain.run("t3", "review", card=bad)
+            except PlanError:
+                pass
+            else:
+                raise AssertionError(f"{bad!r} accepted as a card")
+    assert calls == []
+
+
+def test_a_failing_board_never_breaks_the_run_and_is_logged_once():
+    import logging
+    import threading
+    seen = []
+
+    class Grab(logging.Handler):
+        def emit(self, record):
+            seen.append(record.getMessage())
+
+    log = logging.getLogger("hermes_captain.runner")
+    handler = Grab()
+    log.addHandler(handler)
+    try:
+        for fail in ("raise", "code"):
+            seen.clear()
+            calls, sent, captain = _board_run(thread={"runStatus": "running", "updatedAt": _ago(15)}, waits=[TIMEOUT, TIMEOUT, COMPLETED], fail=fail)
+            assert len(calls) == 2 and len(sent) == 2 and "finished" in sent[1]
+            assert len([m for m in seen if "kanban" in m]) == 1, seen
+    finally:
+        log.removeHandler(handler)
+    # a board that hangs must not hold up the ping
+    gate = threading.Event()
+    import tempfile
+    sent = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        captain, _ = _t3_captain(root, [COMPLETED])
+        record = json.loads((root / "abc.json").read_text())
+        (root / "abc.json").write_text(json.dumps({**record, "card": "t_42"}), encoding="utf-8")
+        _board(captain, gate=gate)
+        captain.notify = lambda run_id, record: sent.append(record["message"]) or True
+        captain.arm_wait("abc")
+        done = captain.wait_done("abc", timeout=8)
+        pinged_while_hung = bool(sent)
+        gate.set()
+    assert done["ping"] == "done" and pinged_while_hung
+
+
+def test_reset_time_parses_three_formats_and_gives_up_on_the_rest():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from hermes_captain.peek import reset_time
+    denver = ZoneInfo("America/Denver")
+    now = datetime(2026, 1, 15, 12, 0, tzinfo=ZoneInfo("UTC")).timestamp()  # 05:00 in Denver
+    at = reset_time("You've hit your limit \u00b7 resets 3:00 PM (America/Denver)", now)
+    assert at == datetime(2026, 1, 15, 15, 0, tzinfo=denver).timestamp()
+    assert reset_time("limit reached, resets 12am (America/Denver)", now) == datetime(2026, 1, 16, 0, 0, tzinfo=denver).timestamp()
+    late = datetime(2026, 1, 15, 16, 0, tzinfo=denver).timestamp()
+    assert reset_time("resets 3pm (America/Denver)", late) == datetime(2026, 1, 16, 15, 0, tzinfo=denver).timestamp()
+    local = reset_time("Usage limit reached. Your limit resets at 3pm", now)
+    assert datetime.fromtimestamp(local).hour == 15 and 0 < local - now <= 86400
+    assert reset_time("usage limit reached. Try again in 2 hours", now) == now + 7200
+    assert reset_time("quota exceeded, try again in 30 minutes", now) == now + 1800
+    for nothing in ("usage limit reached", "", "resets at noonish", "resets 13pm", "resets 3:75pm"):
+        assert reset_time(nothing, now) is None, nothing
+
+
+def _limit_run(lasterr=None, output=None):
+    """A run that hit a usage limit. T3 when lasterr is given, else a CLI that printed output."""
+    import tempfile
+    if lasterr is not None:
+        sent = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            captain, _ = _t3_captain(root, [COMPLETED], thread={"runStatus": "failed", "lastError": lasterr})
+            captain.notify = lambda run_id, record: sent.append(record["message"]) or True
+            captain.arm_wait("abc")
+            captain.wait_done("abc", timeout=8)
+            return sent[0], json.loads((root / "abc.json").read_text())
+    sent = []
+    with tempfile.TemporaryDirectory() as tmp:
+        _cli_wait(Path(tmp), ["python3", "-c", f"print({output!r})"], notes=sent)
+        return sent[0], json.loads((Path(tmp) / "abc.json").read_text())
+
+
+def test_usage_limit_stores_resume_at_or_says_the_time_is_unknown():
+    import time
+    text, saved = _limit_run(lasterr="You've hit your limit \u00b7 resets 3pm (America/Denver)")
+    assert "errored" in text and "It should reset around" in text and "unknown" not in text
+    assert saved["resume_at"] > time.time() and "resumed_at" not in saved
+    text, saved = _limit_run(output="Claude AI usage limit reached. Try again in 2 hours")
+    assert 7100 < saved["resume_at"] - time.time() <= 7200 and "It should reset around" in text
+    text, saved = _limit_run(output="Claude AI usage limit reached")
+    assert "Reset time unknown." in text and "resume_at" not in saved
+    text, saved = _limit_run(output="boom")
+    assert "unknown" not in text and "resume_at" not in saved
+
+
+def _nudges(root, **extra):
+    import time
+    captain, _ = _t3_captain(root, [])
+    record = json.loads((root / "abc.json").read_text())
+    (root / "abc.json").write_text(json.dumps({
+        **record, "pinged_at": time.time() - 60, "follow_up": "delivered", "message": "old", "ping": "errored", **extra,
+    }), encoding="utf-8")
+    sent = []
+    captain.notify = lambda run_id, record: sent.append(record["message"]) or True
+    return captain, sent
+
+
+def test_resume_nudge_fires_once_and_not_before_the_reset():
+    import tempfile
+    import time
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        captain, sent = _nudges(root, resume_at=time.time() + 3600)
+        captain.resume()
+        assert sent == []  # not yet
+        saved = json.loads((root / "abc.json").read_text())
+        saved["resume_at"] = time.time() - 1
+        (root / "abc.json").write_text(json.dumps(saved), encoding="utf-8")
+        for _ in range(3):
+            captain.resume()
+        assert len(sent) == 1
+        assert "Lane 4 hit a usage limit and it should have reset" in sent[0]
+        assert "conductor_steer on run abc: 'Continue where you left off.'" in sent[0]
+        assert json.loads((root / "abc.json").read_text())["resumed_at"] > 0
+    with tempfile.TemporaryDirectory() as tmp:
+        captain, sent = _nudges(Path(tmp))  # no resume_at at all
+        captain.resume()
+        assert sent == []
+
+
+def test_resume_nudge_wording_follows_the_mode_and_the_cap():
+    import tempfile
+    import time
+    due = {"resume_at": time.time() - 1}
+    texts = {}
+    for name, extra in (
+        ("advise", {}),
+        ("drive", {"follow_mode": "drive"}),
+        ("cap", {"follow_mode": "drive", "rounds": 5}),
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            captain, sent = _nudges(Path(tmp), **due, **extra)
+            captain.resume()
+            texts[name] = sent[0]
+    assert "Ask the user first whether to resume it with conductor_steer" in texts["advise"]
+    assert "Resume it with conductor_steer on run abc" in texts["drive"] and "Ask the user" not in texts["drive"]
+    assert "used all 5 follow-ups" in texts["cap"] and "Do not call conductor_steer or conductor_run" in texts["cap"]
+    assert "Resume it" not in texts["cap"]
+    with tempfile.TemporaryDirectory() as tmp:  # a CLI run cannot be steered, so it is told to continue
+        captain, sent = _nudges(Path(tmp), **due, follow_mode="drive", surface="cli", handle="", agent="claude", cwd="/work")
+        captain.resume()
+    assert "conductor_run (agent claude, continue true, cwd /work)" in sent[0] and "conductor_steer" not in sent[0]
+
+
 def test_run_records_last_active():
     import tempfile
     import time
