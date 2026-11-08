@@ -15,7 +15,19 @@ from pathlib import Path
 
 logger = logging.getLogger("hermes_captain.runner")
 
-from .peek import approval_stuck, build_card, git_stat, hold_reply, t3_pending
+from .peek import (
+    approval_stuck,
+    build_card,
+    cache_policy,
+    error_reason,
+    git_stat,
+    hold_reply,
+    idle_seconds,
+    run_health,
+    t3_pending,
+    t3_thread,
+    thread_failure,
+)
 from .plan import (
     HOST_RE,
     PlanError,
@@ -31,6 +43,7 @@ from .plan import (
 
 MAX_READ = 8000
 MAX_RESULT = 1500
+T3_POLL = 60  # seconds per T3 wait; the health check runs between waits
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
@@ -51,6 +64,7 @@ class Captain:
         self.last_peek: dict | None = None
         self.notify = None
         self.retry_delay = 5
+        self.health_every = 30
         self._supervise_stop = threading.Event()
 
     def doctor(self, host: str | None = None) -> dict:
@@ -94,6 +108,7 @@ class Captain:
             "host": kwargs.get("host") or "",
             "cwd": kwargs.get("cwd") or "",
             "keep": keep,
+            "last_active": time.time(),
         }
         if session_key:
             record["session_key"] = session_key
@@ -150,6 +165,7 @@ class Captain:
         if record.get("surface") == "t3" and record.get("handle"):
             record["inspect"] = self._inspect(record)
         stuck = t3_pending(record.get("inspect") or "") or approval_stuck(output, alive)
+        health, why = self._health(record, output, alive, stuck, t3_thread(record.get("inspect") or ""))
         card = build_card(
             record,
             output=output,
@@ -157,6 +173,8 @@ class Captain:
             diff=diff,
             previous=record.get("fingerprint"),
             stuck=stuck,
+            health=health,
+            why=why,
         )
         record["fingerprint"] = card["fingerprint"]
         record["stuck_on_approval"] = card["stuck_on_approval"]
@@ -239,6 +257,7 @@ class Captain:
                 "title": thread.get("title") or "",
                 "status": "running",
                 "keep": False,
+                "last_active": time.time(),
             }
             if session_key:
                 record["session_key"] = session_key
@@ -261,9 +280,9 @@ class Captain:
     def _wait_t3(self, record: dict) -> str:
         host = record.get("host") or None
         fails = 0
-        for _ in range(24):
-            plan = plan_wait(record["handle"], host=host, timeout=600)
-            result = self.capture(plan.argv, None, 620)
+        for _ in range(4 * 3600 // T3_POLL):
+            plan = plan_wait(record["handle"], host=host, timeout=T3_POLL)
+            result = self.capture(plan.argv, None, T3_POLL + 20)
             outcome = _wait_outcome(result.get("stdout") or "") or _wait_outcome(result.get("stderr") or "")
             if outcome == "completed":
                 return "done"
@@ -271,9 +290,13 @@ class Captain:
                 return "needs-attention"
             if outcome == "timeout" or result.get("code") in (6, 124):
                 fails = 0
+                if self._tick(record["id"]) == "errored":
+                    return "errored"
                 continue
             if result.get("code") == 0 and not outcome:
                 return "done"
+            if outcome and self._tick(record["id"]) == "errored":  # a wait answer we do not know may be a failed run
+                return "errored"
             fails += 1  # ssh to the other machine can blip; three in a row is a real failure
             if fails >= 3:
                 return "wait failed"
@@ -301,28 +324,73 @@ class Captain:
         except PlanError:
             return
         ping = "done"
+        code = None
         if record.get("surface") == "t3" and record.get("handle"):
             ping = self._wait_t3(record)
+        elif record.get("pid"):
+            code = self._wait_pid(run_id, record["pid"])
         else:
-            pid = record.get("pid")
-            proc = self._procs.get(int(pid)) if pid else None
-            if proc is not None:
-                proc.wait()
-            elif pid and self._running(pid):
-                while self._running(pid):
-                    time.sleep(0.2)
-            elif not pid:
-                ping = "no process to wait on"
+            ping = "no process to wait on"
         try:
             fresh = self._load(run_id)
         except PlanError:
             return
-        fresh["status"] = "exited" if ping == "done" else fresh.get("status")
+        if code and fresh.get("status") != "stopped":  # our own SIGTERM is not a crash
+            fresh["exit_code"] = code
+        fresh["status"] = "exited" if ping in ("done", "errored") else fresh.get("status")
         fresh["ping"] = ping
-        fresh["pinged_at"] = time.time()
+        fresh["pinged_at"] = fresh["last_active"] = time.time()
         fresh["message"] = self._finish_message(fresh, ping)
         self._save(run_id, fresh)
         self._deliver(run_id, fresh)
+
+    def _wait_pid(self, run_id: str, pid: int) -> int | None:
+        """Block until the process exits, checking health on the way. The exit code, when we are its parent."""
+        last = time.time()
+        while self._running(pid):
+            time.sleep(0.2)
+            if time.time() - last >= self.health_every:
+                last = time.time()
+                self._tick(run_id)
+        proc = self._procs.get(int(pid))
+        return proc.returncode if proc is not None else None
+
+    def _health(self, record: dict, output: str, alive: bool, stuck: bool, thread: dict) -> tuple[str, str]:
+        state = thread.get("runStatus")
+        reason = thread_failure(thread)
+        if state:  # a T3 thread knows better than the record whether it is still going
+            alive = state not in ("idle", "completed") or stuck
+        if not alive and not reason:
+            reason = error_reason(record.get("exit_code"), output)
+        return run_health(alive=alive, idle=idle_seconds(record, thread), stuck=stuck, reason=reason)
+
+    def _tick(self, run_id: str) -> str:
+        """One no-model health check inside the wait. Pings once per stall or approval."""
+        record = self._load(run_id)
+        t3 = record.get("surface") == "t3" and record.get("handle")
+        inspect = self._inspect(record) if t3 else ""
+        output = "" if t3 else self.read(run_id).get("output") or ""
+        stuck = t3_pending(inspect) or approval_stuck(output, True)
+        word, why = self._health(record, output, True, stuck, t3_thread(inspect))
+        alerted = record.get("alerted") or []
+        if word in ("stalled", "needs-approval") and word not in alerted:
+            record["alerted"] = [*alerted, word]
+            self._save(run_id, record)
+            name = record.get("title") or run_id
+            where = f" on {record['host']}" if record.get("host") else ""
+            message = (
+                f"Conductor: {name}{where} is {word}: {why}. Tell the user this now, in one line. "
+                f"Check it with conductor_peek {run_id}. Do not steer it and do not start another run."
+            )
+            try:  # shortcut: a ping that fails to send is not retried; the finish ping still is
+                if self.notify:
+                    self.notify(run_id, {**record, "message": message})
+            except Exception:
+                logger.exception("conductor alert")
+        elif word == "working" and alerted:
+            record["alerted"] = []
+            self._save(run_id, record)
+        return word
 
     def _deliver(self, run_id: str, record: dict) -> None:
         try:
@@ -363,19 +431,21 @@ class Captain:
         name = record.get("title") or record.get("id")
         where = f" on {record['host']}" if record.get("host") else ""
         run_id = record.get("id")
-        if ping not in ("done", "needs-attention"):
+        if ping not in ("done", "needs-attention", "errored"):
             return (
                 f"Conductor: lost track of {name}{where} ({ping}). It may still be running. "
                 f"Tell the user this now. Check it once with conductor_peek {run_id}. Do not start another run."
             )
-        result, pending = "", False
+        result, pending, failure = "", False, ""
         if record.get("surface") == "t3" and record.get("handle"):
             host = record.get("host") or None
             read = plan_read(record.get("agent") or "t3", record["handle"], host=host)
             if read is not None:
                 got = self.capture(read.argv, None, 30)
                 result = _answer_text(got.get("stdout") or "") if got.get("code") == 0 else ""
-            pending = t3_pending(self._inspect(record))
+            inspect = self._inspect(record)
+            pending = t3_pending(inspect)
+            failure = thread_failure(t3_thread(inspect)) or ("the thread run failed" if ping == "errored" else "")
         elif record.get("log") and Path(record["log"]).exists():
             result = Path(record["log"]).read_text(encoding="utf-8", errors="replace").strip()
         if len(result) > MAX_RESULT:
@@ -386,6 +456,13 @@ class Captain:
                 f"Conductor: {name}{where} is waiting on you, probably an approval. "
                 f"Tell the user now that it needs their approval on that machine. What it last said:\n{result}\n"
                 "Do not steer it and do not start another run to get past the approval."
+            )
+        reason = failure or error_reason(record.get("exit_code"), result)
+        if reason:
+            return (
+                f"Conductor: {name}{where} errored: {reason} (run {run_id}). "
+                f"Tell the user now, in one line. What it last said:\n{result}\n"
+                "Do not start another run to retry unless the user says so."
             )
         return (
             f"Conductor: {name}{where} finished (run {run_id}). "
@@ -421,8 +498,13 @@ class Captain:
             return {"ok": False, "output": "could not check for a pending approval, so nothing was sent"}
         if t3_pending(probe.get("stdout") or ""):
             return {"ok": False, "output": "stuck on an approval; approve it on that machine first. Nothing was sent"}
+        thread = t3_thread(probe.get("stdout") or "")
+        policy = cache_policy(idle_seconds(record, thread, use_last_active=True), thread)
         result = self.capture(plan.argv, None, 60)
-        return {"ok": result.get("code") == 0, "output": _clip(result.get("stdout") or result.get("error") or "")}
+        if result.get("code") == 0:
+            record["last_active"] = time.time()
+            self._save(run_id, record)
+        return {"ok": result.get("code") == 0, "output": _clip(result.get("stdout") or result.get("error") or ""), **policy}
 
     def stop(self, run_id: str) -> dict:
         record = self._load(run_id)

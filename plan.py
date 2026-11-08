@@ -52,6 +52,24 @@ def _host_prefix(host: str | None, cwd: str | None, argv: list[str]) -> list[str
     return ssh_argv(host, argv, cwd)
 
 
+def build_prompt(goal: str, files=None, done_when: str = "") -> str:
+    """The model supplies the facts. This supplies the structure."""
+    goal = (goal or "").strip()
+    if not goal:
+        raise PlanError("goal is missing")
+    if isinstance(files, str):
+        files = [files]
+    files = [str(f).strip() for f in files or [] if str(f).strip()]
+    parts = [f"Goal: {goal}"]
+    if files:
+        parts.append("Files in scope:\n" + "\n".join(f"- {f}" for f in files))
+    if (done_when or "").strip():
+        parts.append(f"Done when: {done_when.strip()}")
+    parts.append("One rule: the smallest change that works. No extra features. No new dependencies.")
+    parts.append("End with a short final answer: what changed, and what is left.")
+    return "\n\n".join(parts)
+
+
 def plan_run(
     agent: str,
     prompt: str,

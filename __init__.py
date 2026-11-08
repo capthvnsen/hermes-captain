@@ -7,7 +7,7 @@ import logging
 
 from pathlib import Path
 
-from .plan import PlanError
+from .plan import PlanError, build_prompt
 from .runner import Captain
 
 logger = logging.getLogger(__name__)
@@ -44,9 +44,12 @@ def _doctor(args, **kwargs):
 def _run(args, **kwargs):
     args = args or {}
     try:
+        prompt = str(args.get("prompt") or "")
+        if args.get("goal") or args.get("files") or args.get("done_when") or not prompt.strip():
+            prompt = build_prompt(str(args.get("goal") or ""), args.get("files"), str(args.get("done_when") or ""))
         record = _captain().run(
             str(args.get("agent") or ""),
-            str(args.get("prompt") or ""),
+            prompt,
             cwd=str(args.get("cwd") or "") or None,
             host=str(args.get("host") or "") or None,
             worker=str(args.get("worker") or "") or None,
@@ -155,7 +158,10 @@ _SCHEMAS = {
             "properties": {
                 "agent": {"type": "string", "description": "hermes, claude, codex, grok, opencode, pycode, orca, t3, or another terminal command name. Unknown commands need prompt_flag."},
                 "prompt_flag": {"type": "string", "description": "For an unknown terminal agent only: -p, --print, or --prompt. No other flags are accepted."},
-                "prompt": {"type": "string", "description": "The task to hand off."},
+                "goal": {"type": "string", "description": "What the agent should achieve. Conductor builds the kickoff from goal, files, and done_when, so do not write the structure yourself. Wins over prompt."},
+                "files": {"type": "array", "items": {"type": "string"}, "description": "Files or folders in scope."},
+                "done_when": {"type": "string", "description": "What done looks like, checkable."},
+                "prompt": {"type": "string", "description": "Free-form task, only when goal does not fit."},
                 "cwd": {"type": "string", "description": "Absolute project directory. On a remote host it is passed as an argument, not a shell string."},
                 "host": {"type": "string", "description": "SSH destination when the agent is on another machine. Empty means this machine."},
                 "worker": {"type": "string", "description": "Orca only: which agent tab to launch. Defaults to claude."},
@@ -166,7 +172,7 @@ _SCHEMAS = {
                 "keep": {"type": "boolean", "description": "When this run finishes, ping Hermes to give the next task. Only if the user still wants the work to continue."},
                 "model": {"type": "string", "description": "Plain model id for hermes, claude, or grok. Other agents refuse this. Not a price and not a bypass flag."},
             },
-            "required": ["agent", "prompt"],
+            "required": ["agent"],
         },
     },
     "conductor_read": {
@@ -180,7 +186,7 @@ _SCHEMAS = {
     },
     "conductor_peek": {
         "name": "conductor_peek",
-        "description": "Check a run without dumping the log. Returns speak false when nothing changed, so the lead model stays quiet. Includes a stuck-on-approval flag and a short diff stat when something did change.",
+        "description": "Check a run without dumping the log. Returns speak false when nothing changed, so the lead model stays quiet. Includes a health word (working, quiet, stalled, errored, needs-approval, done), a stuck-on-approval flag, and a short diff stat when something did change.",
         "parameters": {
             "type": "object",
             "properties": {"run_id": {"type": "string"}},
@@ -198,7 +204,7 @@ _SCHEMAS = {
     },
     "conductor_steer": {
         "name": "conductor_steer",
-        "description": "Send a follow-up into a T3 thread with --if-busy steer. Claude, Codex, and Orca runs are one-shot; start another run instead.",
+        "description": "Send a follow-up into a T3 thread with --if-busy steer. Claude, Codex, and Orca runs are one-shot; start another run instead. Returns idle_seconds and cache_warm (true under 5 minutes); when the cache is cold and the thread is long it adds advice for the user.",
         "parameters": {
             "type": "object",
             "properties": {

@@ -523,7 +523,7 @@ def _read_envelope(answer=ANSWER):
     }})
 
 
-def _t3_captain(root, wait_replies, pending=False, read_out=None):
+def _t3_captain(root, wait_replies, pending=False, read_out=None, thread=None):
     read_out = read_out or _read_envelope()
     calls = []
     waits = iter(wait_replies)
@@ -535,7 +535,7 @@ def _t3_captain(root, wait_replies, pending=False, read_out=None):
             return next(waits)
         if "inspect" in cmd:
             req = [{"id": "r1"}] if pending else []
-            return {"code": 0, "stdout": json.dumps({"data": {"thread": {"pendingRequests": req}}}), "stderr": ""}
+            return {"code": 0, "stdout": json.dumps({"data": {"thread": {"pendingRequests": req, **(thread or {})}}}), "stderr": ""}
         if "send" in cmd:
             return {"code": 0, "stdout": "{}", "stderr": ""}
         return {"code": 0, "stdout": read_out, "stderr": ""}
@@ -758,6 +758,305 @@ def test_supervise_picks_up_a_run_the_turn_can_no_longer_wait_on():
         captain._supervise_stop.set()
     assert sent and "pong from the mac" in sent[0]
     assert '"data"' not in sent[0]
+
+
+def _ago(minutes):
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+
+
+def _cli_wait(root, argv, age_minutes=None, notes=None):
+    """Run a real child with a health tick every 0.1s. The log is backdated so the run looks silent."""
+    import os
+    import time
+    from hermes_captain.runner import _spawn
+    captain = Captain(root)
+    captain.health_every = 0.1
+    captain.notify = lambda run_id, record: (notes if notes is not None else []).append(record["message"]) or True
+    log = root / "run.log"
+    pid = _spawn(argv, None, log)
+    captain._procs[pid] = getattr(_spawn, "_last", None)
+    if age_minutes:
+        old = time.time() - age_minutes * 60
+        os.utime(log, (old, old))
+    (root / "abc.json").write_text(json.dumps({
+        "id": "abc", "pid": pid, "surface": "cli", "agent": "claude", "status": "running",
+        "title": "beta", "log": str(log),
+    }), encoding="utf-8")
+    captain.arm_wait("abc")
+    return captain.wait_done("abc", timeout=10)
+
+
+def test_health_words():
+    from hermes_captain.peek import run_health
+    assert run_health(alive=True, idle=5)[0] == "working"
+    assert run_health(alive=True, idle=None)[0] == "working"
+    assert run_health(alive=True, idle=179)[0] == "working"
+    assert run_health(alive=True, idle=180)[0] == "quiet"
+    assert run_health(alive=True, idle=599)[0] == "quiet"
+    assert run_health(alive=True, idle=600) == ("stalled", "no new output for 10 minutes")
+    assert run_health(alive=True, idle=9999, stuck=True)[0] == "needs-approval"
+    assert run_health(alive=False, idle=9999)[0] == "done"
+    assert run_health(alive=False, idle=0, reason="exited with code 2") == ("errored", "exited with code 2")
+
+
+def test_error_reason_names_which_failure():
+    from hermes_captain.peek import error_reason
+    assert error_reason(1, "boom") == "exited with code 1"
+    assert error_reason(0, "") == ""
+    assert error_reason(None, "Claude AI usage limit reached|1700000000") == "usage limit reached"
+    assert error_reason(1, "Invalid API key · Please run /login") == "login failed"
+
+
+def test_peek_reports_health_from_the_log_mtime():
+    import os
+    import tempfile
+    import time
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        log = root / "run.log"
+        log.write_text("compiling\n", encoding="utf-8")
+        (root / "abc.json").write_text(json.dumps({
+            "id": "abc", "agent": "claude", "status": "running", "pid": 1, "log": str(log),
+        }), encoding="utf-8")
+        captain = Captain(root, spawn=lambda *a: 1, capture=lambda *a: {"code": 0, "stdout": ""})
+        first = captain.peek("abc")
+        for minutes, word in ((4, "quiet"), (11, "stalled")):
+            old = time.time() - minutes * 60
+            os.utime(log, (old, old))
+            card = captain.peek("abc")
+            assert card["health"] == word
+            assert card["speak"] is True  # a stall is news even though the log did not change
+        again = captain.peek("abc")
+    assert first["health"] == "working"
+    assert card["note"] == "no new output for 11 minutes"
+    assert again["speak"] is False and again["health"] == "stalled"
+
+
+def test_peek_health_for_finished_and_approval_runs():
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for name, text, extra, word, why in (
+            ("a", "all good\n", {}, "done", "finished"),
+            ("b", "oops\n", {"exit_code": 2}, "errored", "exited with code 2"),
+            ("c", "You have hit your limit\n", {}, "errored", "usage limit reached"),
+            ("d", "Not logged in · Please run /login\n", {}, "errored", "login failed"),
+        ):
+            log = root / f"{name}.log"
+            log.write_text(text, encoding="utf-8")
+            (root / f"{name}.json").write_text(json.dumps({
+                "id": name, "agent": "claude", "status": "exited", "log": str(log), **extra,
+            }), encoding="utf-8")
+            card = Captain(root, capture=lambda *a: {"code": 0, "stdout": ""}).peek(name)
+            assert (card["health"], card["note"]) == (word, why if word == "errored" else card["note"]), name
+        inspect = json.dumps({"data": {"thread": {"pendingRequests": [{"id": "r"}], "runStatus": "idle"}}})
+        (root / "t.json").write_text(json.dumps({
+            "id": "t", "agent": "t3", "surface": "t3", "status": "launched", "handle": "th_1",
+        }), encoding="utf-8")
+        card = Captain(root, capture=lambda argv, c, t: {"code": 0, "stdout": inspect if "inspect" in argv else ""}).peek("t")
+    assert card["health"] == "needs-approval"
+
+
+def test_stall_pings_once_and_quiet_does_not_ping():
+    import tempfile
+    stalled, quiet = [], []
+    with tempfile.TemporaryDirectory() as tmp:
+        done = _cli_wait(Path(tmp), ["sleep", "1"], age_minutes=11, notes=stalled)
+    with tempfile.TemporaryDirectory() as tmp:
+        _cli_wait(Path(tmp), ["sleep", "1"], age_minutes=4, notes=quiet)
+    assert done["ping"] == "done"
+    assert len(stalled) == 2  # one stall ping, one finish ping
+    assert "stalled" in stalled[0] and "no new output for 11 minutes" in stalled[0]
+    assert "finished" in stalled[1]
+    assert len(quiet) == 1 and "finished" in quiet[0]
+
+
+def test_cli_exit_code_and_login_failure_ping_as_errored():
+    import tempfile
+    for argv, expect in (
+        (["python3", "-c", "import sys; sys.exit(3)"], "exited with code 3"),
+        (["python3", "-c", "print('Invalid API key · Please run /login')"], "login failed"),
+        (["python3", "-c", "print('Claude AI usage limit reached|1700000000')"], "usage limit reached"),
+    ):
+        notes = []
+        with tempfile.TemporaryDirectory() as tmp:
+            _cli_wait(Path(tmp), argv, notes=notes)
+        assert len(notes) == 1 and "errored" in notes[0] and expect in notes[0], (argv, notes)
+    ok = []
+    with tempfile.TemporaryDirectory() as tmp:
+        _cli_wait(Path(tmp), ["python3", "-c", "print('fine')"], notes=ok)
+    assert "finished" in ok[0] and "errored" not in ok[0]
+
+
+def test_t3_stall_pings_once_then_the_finish():
+    import tempfile
+    sent = []
+    with tempfile.TemporaryDirectory() as tmp:
+        captain, calls = _t3_captain(
+            Path(tmp), [TIMEOUT, TIMEOUT, COMPLETED], thread={"runStatus": "running", "updatedAt": _ago(15)},
+        )
+        captain.notify = lambda run_id, record: sent.append(record["message"]) or True
+        captain.arm_wait("abc")
+        captain.wait_done("abc", timeout=8)
+    assert len(sent) == 2
+    assert "stalled" in sent[0] and "15 minutes" in sent[0]
+    assert "finished" in sent[1]
+
+
+def test_t3_busy_thread_does_not_ping_and_failed_run_is_errored():
+    import tempfile
+    sent = []
+    with tempfile.TemporaryDirectory() as tmp:
+        captain, _ = _t3_captain(
+            Path(tmp), [TIMEOUT, COMPLETED], thread={"runStatus": "running", "updatedAt": _ago(1)},
+        )
+        captain.notify = lambda run_id, record: sent.append(record["message"]) or True
+        captain.arm_wait("abc")
+        captain.wait_done("abc", timeout=8)
+    assert len(sent) == 1 and "finished" in sent[0]
+    failed = []
+    with tempfile.TemporaryDirectory() as tmp:
+        captain, calls = _t3_captain(Path(tmp), [TIMEOUT, COMPLETED], thread={"runStatus": "failed"})
+        captain.notify = lambda run_id, record: failed.append(record["message"]) or True
+        captain.arm_wait("abc")
+        done = captain.wait_done("abc", timeout=8)
+    assert done["ping"] == "errored"
+    assert len(failed) == 1 and "errored: the thread run failed" in failed[0]
+    assert len([a for a in calls if " wait " in a[-1]]) == 1
+
+
+def test_build_prompt_gives_the_structure():
+    from hermes_captain.plan import build_prompt
+    prompt = build_prompt("make login redirect", ["app/login.py", "tests/test_login.py"], "pytest tests/test_login.py passes")
+    for part in ("Goal: make login redirect", "- app/login.py", "- tests/test_login.py", "Done when: pytest tests/test_login.py passes",
+                 "smallest change that works", "No extra features", "No new dependencies", "short final answer: what changed, and what is left"):
+        assert part in prompt, part
+    bare = build_prompt("fix it")
+    assert "Files in scope" not in bare and "Done when" not in bare and "smallest change" in bare
+    assert "- a.py" in build_prompt("x", "a.py")
+    try:
+        build_prompt("  ", ["a.py"])
+    except PlanError as exc:
+        assert str(exc) == "goal is missing"
+    else:
+        raise AssertionError("empty goal was accepted")
+
+
+def _entry():
+    spec = importlib.util.spec_from_file_location(
+        "hermes_captain_entry", ROOT / "__init__.py", submodule_search_locations=[str(ROOT)],
+    )
+    entry = importlib.util.module_from_spec(spec)
+    entry.__package__ = "hermes_captain"
+    sys.modules["hermes_captain_entry"] = entry
+    spec.loader.exec_module(entry)
+    return entry
+
+
+def test_conductor_run_builds_the_kickoff_and_keeps_the_free_form_path():
+    import tempfile
+    seen = []
+
+    def capture(argv, cwd, timeout):
+        seen.append(argv[argv.index("--prompt") + 1])
+        return {"code": 0, "stdout": "{}", "error": ""}
+
+    entry = _entry()
+    with tempfile.TemporaryDirectory() as tmp:
+        entry._CAPTAIN = Captain(Path(tmp), capture=capture)
+        built = json.loads(entry._run({"agent": "t3", "goal": "fix login", "files": ["a.py"], "done_when": "tests pass"}))
+        free = json.loads(entry._run({"agent": "t3", "prompt": "just do the thing"}))
+        none = json.loads(entry._run({"agent": "t3"}))
+        no_goal = json.loads(entry._run({"agent": "t3", "files": ["a.py"]}))
+    assert built["ok"] and free["ok"]
+    assert seen[0].startswith("Goal: fix login") and "- a.py" in seen[0] and "Done when: tests pass" in seen[0]
+    assert seen[1] == "just do the thing"
+    assert none == {"ok": False, "error": "goal is missing"} == no_goal
+    assert len(seen) == 2
+
+
+def _steer_with(root, thread, last_active=None):
+    captain, calls = _t3_captain(root, [], thread=thread)
+    if last_active is not None:
+        record = json.loads((root / "abc.json").read_text())
+        record["last_active"] = last_active
+        (root / "abc.json").write_text(json.dumps(record), encoding="utf-8")
+    return captain.steer("abc", "next step"), json.loads((root / "abc.json").read_text())
+
+
+def test_steer_reports_cache_and_advises_only_when_cold_and_long():
+    import tempfile
+    import time
+    from hermes_captain.peek import LONG_THREAD
+    with tempfile.TemporaryDirectory() as tmp:
+        warm, saved = _steer_with(Path(tmp), {"updatedAt": _ago(1), "turnCount": 99})
+    assert warm["ok"] is True and warm["cache_warm"] is True and 50 <= warm["idle_seconds"] <= 70
+    assert "advice" not in warm
+    assert abs(saved["last_active"] - time.time()) < 5
+    with tempfile.TemporaryDirectory() as tmp:
+        cold, _ = _steer_with(Path(tmp), {"updatedAt": _ago(10), "turnCount": LONG_THREAD})
+    assert cold["ok"] is True and cold["cache_warm"] is False and cold["idle_seconds"] >= 590
+    assert "re-reads the whole history" in cold["advice"] and "two-line summary" in cold["advice"]
+    assert "saving" not in cold["advice"] and "%" not in cold["advice"]
+    with tempfile.TemporaryDirectory() as tmp:
+        short, _ = _steer_with(Path(tmp), {"updatedAt": _ago(10), "turnCount": LONG_THREAD - 1})
+    assert short["cache_warm"] is False and "advice" not in short
+    with tempfile.TemporaryDirectory() as tmp:
+        by_messages, _ = _steer_with(Path(tmp), {"updatedAt": _ago(10), "messageCount": LONG_THREAD * 2})
+    assert "advice" in by_messages
+
+
+def test_steer_falls_back_to_last_active_and_never_guesses():
+    import tempfile
+    import time
+    with tempfile.TemporaryDirectory() as tmp:
+        cold, _ = _steer_with(Path(tmp), {"turnCount": 99}, last_active=time.time() - 3600)
+    assert cold["cache_warm"] is False and cold["idle_seconds"] >= 3590 and "advice" in cold
+    with tempfile.TemporaryDirectory() as tmp:
+        unknown, _ = _steer_with(Path(tmp), {"turnCount": 99})
+    assert unknown["cache_warm"] is None and unknown["idle_seconds"] is None and "advice" not in unknown
+
+
+def _t3_finish(thread, waits):
+    import tempfile
+    sent = []
+    with tempfile.TemporaryDirectory() as tmp:
+        captain, _ = _t3_captain(Path(tmp), waits, thread=thread)
+        captain.notify = lambda run_id, record: sent.append(record["message"]) or True
+        captain.arm_wait("abc")
+        done = captain.wait_done("abc", timeout=8)
+        card = captain.peek("abc")
+    return done, sent, card
+
+
+def test_failed_thread_reports_its_last_error_cut_to_160():
+    error = "Claude Code can't use your Claude subscription, usually because a payment is past due \u00b7 Pay or renew at https://example.com/" + "x" * 200
+    done, sent, card = _t3_finish(
+        {"runStatus": "failed", "lastError": error, "lastErrorClass": "provider_error", "lastErrorCode": "api_error_403"},
+        [TIMEOUT, COMPLETED],
+    )
+    assert done["ping"] == "errored"
+    assert len(sent) == 1 and f"errored: {error[:160]} (run" in sent[0] and error[:161] not in sent[0]
+    assert card["health"] == "errored" and card["note"] == error[:160]
+    done, sent, card = _t3_finish({"runStatus": "failed", "lastError": "  "}, [TIMEOUT, COMPLETED])
+    assert "errored: the thread run failed" in sent[0] and card["note"] == "the thread run failed"
+
+
+def test_interrupted_thread_is_errored_and_never_a_normal_finish():
+    for waits in ([TIMEOUT, COMPLETED], [COMPLETED]):  # the tick sees it, or wait calls it completed
+        done, sent, card = _t3_finish({"runStatus": "interrupted"}, waits)
+        assert len(sent) == 1 and "errored: the run was interrupted" in sent[0], waits
+        assert "finished" not in sent[0]
+        assert card["health"] == "errored" and card["note"] == "the run was interrupted"
+
+
+def test_run_records_last_active():
+    import tempfile
+    import time
+    with tempfile.TemporaryDirectory() as tmp:
+        record = Captain(Path(tmp), capture=lambda *a: {"code": 0, "stdout": "{}", "error": ""}).run("t3", "review")
+    assert abs(record["last_active"] - time.time()) < 5
 
 
 if __name__ == "__main__":
