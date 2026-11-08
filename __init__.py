@@ -253,10 +253,7 @@ def _follow_up(run_id: str, record: dict) -> bool:
     ctx = _CTX
     if ctx is None:
         return False
-    text = (
-        f"Conductor: {record.get('title') or run_id} finished. "
-        "Pick up the result. Do not wait for the user to ask."
-    )
+    text = record.get("message") or f"Conductor: {record.get('title') or run_id} finished. Read it and tell the user."
     try:
         return bool(ctx.inject_message(text, session_key=record.get("session_key") or None))
     except Exception:
@@ -268,6 +265,7 @@ def register(ctx):
     global _CTX
     _CTX = ctx
     _captain().notify = _follow_up
+    _captain().resume()
     ctx.register_skill(
         "lead",
         Path(__file__).resolve().parent / "skills" / "lead" / "SKILL.md",

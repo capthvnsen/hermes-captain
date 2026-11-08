@@ -136,6 +136,7 @@ def test_run_does_not_spawn_when_the_launcher_returns():
             capture=capture,
         )
         record = captain.run("t3", "review the diff")
+        captain.wait_done(record["id"], timeout=8)
     assert record["handle"] == "th_1"
     assert record["status"] == "launched"
     assert seen["argv"][0] == "t3code"
@@ -465,6 +466,8 @@ def test_t3_timeout_on_stderr_keeps_waiting():
     calls = {"n": 0}
 
     def capture(argv, cwd, timeout):
+        if "wait" not in argv:
+            return {"code": 0, "stdout": "", "stderr": ""}
         calls["n"] += 1
         if calls["n"] == 1:
             return {
@@ -492,6 +495,245 @@ def test_t3_timeout_on_stderr_keeps_waiting():
     assert calls["n"] == 2
     assert done["ping"] == "done"
     assert notes == ["done"]
+
+
+HANDLE = "thread:delegated-task:command%3Amcp%3A58968731-a581-4993-8fff-3cb51a5a132e%3Adelegate-task%3A2490cc31"
+MAC = "alex@100.72.158.127"
+
+
+ANSWER = "Fixed the bug. 3 tests pass."
+
+
+def _read_envelope(answer=ANSWER):
+    """Shape of `t3code --json threads read --detail answers --last-turn`, checked against a real T3 0.1.7 run."""
+    return json.dumps({"ok": True, "data": {
+        "runtime": {"origin": "http://127.0.0.1:3773", "serverVersion": "0.1.7", "capabilities": {"threadStop": True}},
+        "auth": {"source": "desktop"},
+        "snapshotSequence": 60080,
+        "project": {"id": "p1", "title": "caas", "workspaceRoot": "/Users/alex/Projects/caas"},
+        "thread": {
+            "id": "mcp:58968731-a581-4993-8fff-3cb51a5a132e", "title": "Lane 4", "runStatus": "idle",
+            "turns": [{"index": 1, "turnId": "run:1", "state": "completed", "finalMessageId": "message:provider:2"}],
+            "messages": [
+                {"id": "message:user:1", "role": "user", "text": "Please fix the bug", "turnId": "run:1", "streaming": False},
+                {"id": "message:provider:1", "role": "assistant", "text": "Looking at it now", "turnId": "run:1", "streaming": False},
+                {"id": "message:provider:2", "role": "assistant", "text": answer, "turnId": "run:1", "streaming": False, "textTruncated": False},
+            ],
+        },
+    }})
+
+
+def _t3_captain(root, wait_replies, pending=False, read_out=None):
+    read_out = read_out or _read_envelope()
+    calls = []
+    waits = iter(wait_replies)
+
+    def capture(argv, cwd, timeout):
+        calls.append(argv)
+        cmd = argv[-1]
+        if " wait " in cmd:
+            return next(waits)
+        if "inspect" in cmd:
+            req = [{"id": "r1"}] if pending else []
+            return {"code": 0, "stdout": json.dumps({"data": {"thread": {"pendingRequests": req}}}), "stderr": ""}
+        if "send" in cmd:
+            return {"code": 0, "stdout": "{}", "stderr": ""}
+        return {"code": 0, "stdout": read_out, "stderr": ""}
+
+    captain = Captain(root, capture=capture)
+    captain.retry_delay = 0
+    (root / "abc.json").write_text(json.dumps({
+        "id": "abc", "agent": "t3", "surface": "t3", "handle": HANDLE, "host": MAC,
+        "status": "running", "session_key": "sess-1", "title": "Lane 4",
+    }), encoding="utf-8")
+    return captain, calls
+
+
+TIMEOUT = {"code": 6, "stdout": "", "stderr": json.dumps({"ok": False, "error": {"code": "THREAD_WAIT_TIMEOUT"}})}
+COMPLETED = {"code": 0, "stdout": json.dumps({"data": {"wait": {"outcome": "completed"}}}), "stderr": ""}
+
+
+def test_vps_to_mac_finish_sends_the_result_once_after_a_timeout():
+    import tempfile
+    sent = []
+    with tempfile.TemporaryDirectory() as tmp:
+        captain, calls = _t3_captain(Path(tmp), [TIMEOUT, COMPLETED])
+        captain.notify = lambda run_id, record: sent.append(record["message"]) or True
+        captain.arm_wait("abc")
+        captain.wait_done("abc", timeout=8)
+        saved = json.loads((Path(tmp) / "abc.json").read_text())
+    assert len(sent) == 1  # the timeout did not report finished
+    assert ANSWER in sent[0]
+    for wrapper in ('"ok"', '"data"', "serverVersion", "capabilities", "Please fix the bug", "Looking at it now", "message:provider"):
+        assert wrapper not in sent[0]
+    assert "conductor_steer" in sent[0] and "Lane 4" in sent[0]
+    assert saved["follow_up"] == "delivered"
+    waits = [a for a in calls if "wait" in a[-1]]
+    assert len(waits) == 2
+    for argv in waits:
+        assert argv[0] == "ssh" and "BatchMode=yes" in argv and MAC in argv
+        assert '.local/bin' in argv[-1] and HANDLE in argv[-1].replace("'", "")
+        assert not any(b in _flags(argv) for b in BANNED)
+
+
+def test_answer_text_reads_the_final_assistant_message_only():
+    from hermes_captain.runner import _answer_text
+    assert _answer_text(_read_envelope("All done.")) == "All done."
+    still_streaming = json.loads(_read_envelope())
+    still_streaming["data"]["thread"]["messages"][-1]["streaming"] = True
+    assert _answer_text(json.dumps(still_streaming)) == "Looking at it now"
+    no_answer = json.loads(_read_envelope())
+    no_answer["data"]["thread"]["messages"] = no_answer["data"]["thread"]["messages"][:1]
+    assert _answer_text(json.dumps(no_answer)) == ""
+    assert _answer_text("plain text answer\n") == "plain text answer"
+
+
+def test_approval_pending_tells_the_user_and_blocks_steering():
+    import tempfile
+    sent = []
+    with tempfile.TemporaryDirectory() as tmp:
+        captain, calls = _t3_captain(Path(tmp), [COMPLETED], pending=True)
+        captain.notify = lambda run_id, record: sent.append(record["message"]) or True
+        captain.arm_wait("abc")
+        captain.wait_done("abc", timeout=8)
+        steered = captain.steer("abc", "keep going")
+    assert "approval" in sent[0] and "Do not steer" in sent[0]
+    assert "conductor_steer on run" not in sent[0]
+    assert steered["ok"] is False
+    assert not any("send" in a[-1] for a in calls)
+
+
+def test_steer_goes_through_when_nothing_is_pending():
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        captain, calls = _t3_captain(Path(tmp), [])
+        steered = captain.steer("abc", "now add a test")
+    assert steered["ok"] is True
+    assert any("--if-busy" in a[-1] for a in calls)
+
+
+def test_lost_wait_still_tells_the_user():
+    import tempfile
+    sent = []
+    down = {"code": 255, "stdout": "", "stderr": "ssh: connect timed out"}
+    with tempfile.TemporaryDirectory() as tmp:
+        captain, calls = _t3_captain(Path(tmp), [down, down, down])
+        captain.notify = lambda run_id, record: sent.append(record["message"]) or True
+        captain.arm_wait("abc")
+        done = captain.wait_done("abc", timeout=8)
+    assert done["ping"] == "wait failed"
+    assert len(sent) == 1 and "lost track" in sent[0] and "may still be running" in sent[0]
+
+
+def test_undelivered_message_is_resent_after_restart():
+    import tempfile
+    sent = []
+    with tempfile.TemporaryDirectory() as tmp:
+        captain, _ = _t3_captain(Path(tmp), [COMPLETED])
+        captain.notify = lambda run_id, record: False
+        captain.arm_wait("abc")
+        captain.wait_done("abc", timeout=8)
+        assert json.loads((Path(tmp) / "abc.json").read_text())["follow_up"] == "undelivered"
+        again = Captain(Path(tmp), capture=lambda *a: {"code": 0, "stdout": ""})
+        again.notify = lambda run_id, record: sent.append(record["message"]) or True
+        again.resume()
+        assert json.loads((Path(tmp) / "abc.json").read_text())["follow_up"] == "delivered"
+    assert len(sent) == 1 and "Fixed the bug" in sent[0]
+
+
+def test_plugin_injects_the_result_into_the_asking_session():
+    spec = importlib.util.spec_from_file_location("hermes_captain.entry", ROOT / "__init__.py")
+    entry = importlib.util.module_from_spec(spec)
+    sys.modules["hermes_captain.entry"] = entry
+    spec.loader.exec_module(entry)
+    got = {}
+
+    class Ctx:
+        def inject_message(self, text, session_key=None):
+            got.update(text=text, key=session_key)
+            return True
+
+    entry._CTX = Ctx()
+    record = {"message": "Conductor: Lane 4 finished. Fixed the bug.", "session_key": "sess-1"}
+    assert entry._follow_up("abc", record) is True
+    assert got == {"text": record["message"], "key": "sess-1"}
+    entry._CTX = None
+    assert entry._follow_up("abc", record) is False
+
+
+
+def test_long_answer_keeps_the_end_and_says_what_was_cut():
+    import tempfile
+    sent = []
+    answer = "HEAD" + "x" * 2500 + "THE CONCLUSION"
+    with tempfile.TemporaryDirectory() as tmp:
+        captain, _ = _t3_captain(Path(tmp), [COMPLETED], read_out=_read_envelope(answer))
+        captain.notify = lambda run_id, record: sent.append(record["message"]) or True
+        captain.arm_wait("abc")
+        captain.wait_done("abc", timeout=8)
+    cut = len(answer) - 1500
+    assert f"[first {cut} characters cut]\n" in sent[0]
+    assert sent[0].index("characters cut") < sent[0].index("xxx")
+    assert "THE CONCLUSION" in sent[0] and "HEAD" not in sent[0]
+    assert '"data"' not in sent[0] and "serverVersion" not in sent[0]
+
+
+def test_short_answer_is_not_marked_as_cut():
+    import tempfile
+    sent = []
+    with tempfile.TemporaryDirectory() as tmp:
+        captain, _ = _t3_captain(Path(tmp), [COMPLETED])
+        captain.notify = lambda run_id, record: sent.append(record["message"]) or True
+        captain.arm_wait("abc")
+        captain.wait_done("abc", timeout=8)
+    assert "characters cut" not in sent[0]
+
+
+def _cli_record(root, pid, started):
+    (root / "abc.json").write_text(json.dumps({
+        "id": "abc", "pid": pid, "pid_started": started, "surface": "cli", "agent": "claude",
+        "status": "running", "session_key": "sess-1", "title": "Lane 4",
+    }), encoding="utf-8")
+
+
+def test_restart_rearms_a_cli_wait_only_for_the_same_process():
+    import tempfile
+    from hermes_captain.runner import _proc_start, _spawn
+    sent = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        pid = _spawn(["sleep", "1"], None, root / "run.log")
+        proc = getattr(_spawn, "_last", None)
+        _cli_record(root, pid, _proc_start(pid))
+        import threading
+        threading.Thread(target=proc.wait, daemon=True).start()  # in real life init reaps it; here the test is the parent
+        fresh = Captain(root)
+        fresh.notify = lambda run_id, record: sent.append(record["message"]) or True
+        fresh.resume()
+        done = fresh.wait_done("abc", timeout=8)
+    assert done["ping"] == "done"
+    assert "finished" in sent[0]
+
+
+def test_restart_does_not_attach_to_a_stranger_with_the_same_pid():
+    import tempfile
+    from hermes_captain.runner import _spawn
+    for started in ("Mon Jan  1 00:00:00 2001", ""):  # a different start time, and a record from before start times were kept
+        sent = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pid = _spawn(["sleep", "30"], None, root / "run.log")
+            proc = getattr(_spawn, "_last", None)
+            _cli_record(root, pid, started)
+            fresh = Captain(root)
+            fresh.notify = lambda run_id, record: sent.append(record["message"]) or True
+            fresh.resume()
+            saved = json.loads((root / "abc.json").read_text())
+            proc.terminate()
+            proc.wait()
+        assert "abc" not in fresh._waits
+        assert saved["ping"] == "wait lost" and saved["follow_up"] == "delivered"
+        assert len(sent) == 1 and "lost track" in sent[0] and "may still be running" in sent[0]
 
 
 if __name__ == "__main__":

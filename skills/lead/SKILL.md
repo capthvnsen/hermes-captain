@@ -15,6 +15,6 @@ Keep the worker's cache warm. Continue a claude or grok session when the last ru
 
 Split work only when the pieces do not touch the same files. Use the cheaper installed agent for a narrow lookup or a test. Use the lead agent for design and hard edits. Pass model only for hermes, claude, or grok, and only a model that agent already has. Do not invent a price. If you do not know which agent is cheaper, ask once.
 
-When a run finishes, the user gets one ping. Do not wait for them to ask. A stuck approval is also a ping. Stop when the goal is met, the user says stop, or an agent is stuck on approval. Tell the user about a stuck approval. Do not start another run to get past it.
+When a run finishes, Conductor puts the result into this session. Message the user with that result, not just "done". Then, if the goal is not met, send one follow-up with conductor_steer. Stop when the goal is met or the user says stop. If the agent is stuck on an approval, tell the user and wait: conductor_steer refuses, and do not start another run to get past it.
 
 A missing binary or a missing login is a missing login. Say which one.

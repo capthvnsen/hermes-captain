@@ -27,6 +27,7 @@ from .plan import (
 )
 
 MAX_READ = 8000
+MAX_RESULT = 1500
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
@@ -46,6 +47,7 @@ class Captain:
         self._waits: dict[str, threading.Thread] = {}
         self.last_peek: dict | None = None
         self.notify = None
+        self.retry_delay = 5
 
     def doctor(self, host: str | None = None) -> dict:
         names = ("hermes", "claude", "codex", "grok", "opencode", "pycode", "orca", "t3code", "kimi", "pi", "commandcode")
@@ -106,6 +108,7 @@ class Captain:
                     self._procs[proc.pid] = proc
             record["status"] = "running"
             record["pid"] = pid
+            record["pid_started"] = _proc_start(pid)
             record["log"] = str(log_path)
         self._save(run_id, record)
         if record.get("pid") or (record.get("surface") == "t3" and record.get("handle")):
@@ -219,6 +222,7 @@ class Captain:
 
     def _wait_t3(self, record: dict) -> str:
         host = record.get("host") or None
+        fails = 0
         for _ in range(24):
             plan = plan_wait(record["handle"], host=host, timeout=600)
             result = self.capture(plan.argv, None, 620)
@@ -228,10 +232,14 @@ class Captain:
             if outcome == "needs-attention":
                 return "needs-attention"
             if outcome == "timeout" or result.get("code") in (6, 124):
+                fails = 0
                 continue
             if result.get("code") == 0 and not outcome:
                 return "done"
-            return "wait failed"
+            fails += 1  # ssh to the other machine can blip; three in a row is a real failure
+            if fails >= 3:
+                return "wait failed"
+            time.sleep(self.retry_delay)
         return "wait failed"
 
     def wait_done(self, run_id: str, timeout: float = 30) -> dict:
@@ -274,13 +282,79 @@ class Captain:
         fresh["status"] = "exited" if ping == "done" else fresh.get("status")
         fresh["ping"] = ping
         fresh["pinged_at"] = time.time()
+        fresh["message"] = self._finish_message(fresh, ping)
         self._save(run_id, fresh)
-        if ping in ("done", "needs-attention") and self.notify:
+        self._deliver(run_id, fresh)
+
+    def _deliver(self, run_id: str, record: dict) -> None:
+        try:
+            sent = bool(self.notify and self.notify(run_id, record))
+        except Exception:
+            sent = False
+        record["follow_up"] = "delivered" if sent else "undelivered"
+        self._save(run_id, record)
+
+    def resume(self) -> None:
+        """After a restart: re-send missed messages and re-arm T3 waits."""
+        for path in sorted(self.data_dir.glob("*.json")):
             try:
-                self.notify(run_id, fresh)
-            except Exception:
-                fresh["follow_up"] = "ping failed"
-                self._save(run_id, fresh)
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            run_id = record.get("id") or ""
+            if not RUN_ID_RE.fullmatch(run_id):
+                continue
+            if record.get("follow_up") == "undelivered" and record.get("message"):
+                self._deliver(run_id, record)
+            elif record.get("pinged_at") or run_id in self._waits:
+                continue
+            elif record.get("handle"):
+                self.arm_wait(run_id)
+            elif record.get("pid"):
+                started = _proc_start(record["pid"])
+                if started and started == record.get("pid_started"):
+                    self.arm_wait(run_id)
+                else:  # a pid alone can belong to a stranger now
+                    record["ping"] = "wait lost"
+                    record["pinged_at"] = time.time()
+                    record["message"] = self._finish_message(record, "wait lost")
+                    self._save(run_id, record)
+                    self._deliver(run_id, record)
+
+    def _finish_message(self, record: dict, ping: str) -> str:
+        name = record.get("title") or record.get("id")
+        where = f" on {record['host']}" if record.get("host") else ""
+        run_id = record.get("id")
+        if ping not in ("done", "needs-attention"):
+            return (
+                f"Conductor: lost track of {name}{where} ({ping}). It may still be running. "
+                f"Tell the user this now. Check it once with conductor_peek {run_id}. Do not start another run."
+            )
+        result, pending = "", False
+        if record.get("surface") == "t3" and record.get("handle"):
+            host = record.get("host") or None
+            read = plan_read(record.get("agent") or "t3", record["handle"], host=host)
+            if read is not None:
+                got = self.capture(read.argv, None, 30)
+                result = _answer_text(got.get("stdout") or "") if got.get("code") == 0 else ""
+            pending = t3_pending(self._inspect(record))
+        elif record.get("log") and Path(record["log"]).exists():
+            result = Path(record["log"]).read_text(encoding="utf-8", errors="replace").strip()
+        if len(result) > MAX_RESULT:
+            result = f"[first {len(result) - MAX_RESULT} characters cut]\n{result[-MAX_RESULT:]}"
+        result = result or "(the agent returned no answer text)"
+        if pending or ping == "needs-attention":
+            return (
+                f"Conductor: {name}{where} is waiting on you, probably an approval. "
+                f"Tell the user now that it needs their approval on that machine. What it last said:\n{result}\n"
+                "Do not steer it and do not start another run to get past the approval."
+            )
+        return (
+            f"Conductor: {name}{where} finished (run {run_id}). "
+            f"Message the user now with this result, in your own words:\n{result}\n"
+            f"Then: if the user's goal is met, stop. If it is not, send one follow-up with conductor_steer on run {run_id}. "
+            "Never start another run to get past an approval."
+        )
 
     def _inspect(self, record: dict) -> str:
         plan = plan_inspect(record["handle"], host=record.get("host") or None)
@@ -304,6 +378,11 @@ class Captain:
     def steer(self, run_id: str, prompt: str) -> dict:
         record = self._load(run_id)
         plan = plan_steer(record.get("agent") or "", record.get("handle") or "", prompt, host=record.get("host") or None)
+        probe = self.capture(plan_inspect(record["handle"], host=record.get("host") or None).argv, None, 20)
+        if probe.get("code") != 0:
+            return {"ok": False, "output": "could not check for a pending approval, so nothing was sent"}
+        if t3_pending(probe.get("stdout") or ""):
+            return {"ok": False, "output": "stuck on an approval; approve it on that machine first. Nothing was sent"}
         result = self.capture(plan.argv, None, 60)
         return {"ok": result.get("code") == 0, "output": _clip(result.get("stdout") or result.get("error") or "")}
 
@@ -372,6 +451,26 @@ def _wait_outcome(stdout: str) -> str:
     return ""
 
 
+def _answer_text(stdout: str) -> str:
+    """The assistant's final answer from `t3code threads read`, never the JSON wrapper."""
+    try:
+        data = json.loads(stdout or "")
+    except json.JSONDecodeError:
+        return (stdout or "").strip()
+    inner = data.get("data") if isinstance(data, dict) else None
+    thread = inner.get("thread") if isinstance(inner, dict) else None
+    if not isinstance(thread, dict):
+        return ""
+    messages = [m for m in thread.get("messages") or [] if isinstance(m, dict) and m.get("role") == "assistant" and not m.get("streaming")]
+    turns = [t for t in thread.get("turns") or [] if isinstance(t, dict)]
+    final = turns[-1].get("finalMessageId") if turns else None
+    for message in messages:
+        if message.get("id") == final and isinstance(message.get("text"), str):
+            return message["text"].strip()
+    texts = [m["text"].strip() for m in messages if isinstance(m.get("text"), str) and m["text"].strip()]
+    return texts[-1] if texts else ""
+
+
 def _clip(text: str) -> str:
     text = text or ""
     if len(text) <= MAX_READ:
@@ -408,9 +507,20 @@ def _guess_handle(output: str) -> str:
     return ""
 
 
+def _proc_start(pid: int) -> str:
+    """Start time of a pid. Same pid with a different start time is a different process."""
+    try:
+        done = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))], capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return ""
+    return (done.stdout or "").strip()
+
+
 def _alive(pid: int) -> bool:
     try:
         os.kill(int(pid), 0)
+    except PermissionError:
+        return True
     except OSError:
         return False
     return True
