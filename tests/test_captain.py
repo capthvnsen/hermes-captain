@@ -736,6 +736,30 @@ def test_restart_does_not_attach_to_a_stranger_with_the_same_pid():
         assert len(sent) == 1 and "lost track" in sent[0] and "may still be running" in sent[0]
 
 
+def test_supervise_picks_up_a_run_the_turn_can_no_longer_wait_on():
+    import tempfile
+    import time
+    sent = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "abc.json").write_text(json.dumps({
+            "id": "abc", "surface": "t3", "agent": "t3", "handle": "mcp:1",
+            "title": "proof", "status": "running", "session_key": "sess-1",
+        }), encoding="utf-8")
+        captain = Captain(root, capture=lambda argv, cwd, timeout: {
+            "code": 0, "stdout": _read_envelope("pong from the mac"),
+        })
+        captain.notify = lambda run_id, record: sent.append(record["message"]) or True
+        assert captain.supervise(interval=0.05) is True
+        assert Captain(root).supervise(interval=0.05) is False
+        deadline = time.time() + 3
+        while not sent and time.time() < deadline:
+            time.sleep(0.05)
+        captain._supervise_stop.set()
+    assert sent and "pong from the mac" in sent[0]
+    assert '"data"' not in sent[0]
+
+
 if __name__ == "__main__":
     import traceback
     failed = 0

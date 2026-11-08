@@ -265,6 +265,7 @@ def register(ctx):
     global _CTX
     _CTX = ctx
     _captain().notify = _follow_up
+    _captain().supervise()
     _captain().resume()
     ctx.register_skill(
         "lead",

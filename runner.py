@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import signal
@@ -11,6 +12,8 @@ import threading
 import time
 import uuid
 from pathlib import Path
+
+logger = logging.getLogger("hermes_captain.runner")
 
 from .peek import approval_stuck, build_card, git_stat, hold_reply, t3_pending
 from .plan import (
@@ -48,6 +51,7 @@ class Captain:
         self.last_peek: dict | None = None
         self.notify = None
         self.retry_delay = 5
+        self._supervise_stop = threading.Event()
 
     def doctor(self, host: str | None = None) -> dict:
         names = ("hermes", "claude", "codex", "grok", "opencode", "pycode", "orca", "t3code", "kimi", "pi", "commandcode")
@@ -159,6 +163,40 @@ class Captain:
         self._save(run_id, record)
         self.last_peek = {"speak": card["speak"], "run_id": run_id}
         return card
+
+    def supervise(self, interval: float = 2.0) -> bool:
+        """Keep waits alive after the turn that started them has exited.
+
+        The lock is held for the life of this process. A short-lived turn worker
+        loses the race to the gateway, which is the process that can message the user.
+        """
+        import fcntl
+
+        if getattr(self, "_supervisor", None) and self._supervisor.is_alive():
+            return True
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = self.data_dir / ".supervisor.lock"
+        lock_path.touch()
+        handle = open(lock_path, "a+")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            return False
+        self._lock_handle = handle
+
+        def loop() -> None:
+            while not self._supervise_stop.is_set():
+                try:
+                    self.resume()
+                except Exception:
+                    logger.exception("conductor supervise")
+                self._supervise_stop.wait(interval)
+
+        thread = threading.Thread(target=loop, name="conductor-supervise", daemon=True)
+        thread.start()
+        self._supervisor = thread
+        return True
 
     def arm_wait(self, run_id: str) -> dict:
         """Wait for the run with no model. A 15-minute check cannot beat this."""
