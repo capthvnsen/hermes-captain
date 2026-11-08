@@ -68,13 +68,13 @@ def test_t3_handover_requires_approval():
 
 def test_remote_host_is_one_quoted_command():
     import shlex
-    plan = plan_run("claude", "fix it", host="alex@100.72.158.127", cwd="/Users/alex/app")
+    plan = plan_run("claude", "fix it", host="dev@203.0.113.7", cwd="/Users/dev/app")
     assert plan.argv[:3] == ["ssh", "-o", "BatchMode=yes"]
-    assert plan.argv[5] == "alex@100.72.158.127"
+    assert plan.argv[5] == "dev@203.0.113.7"
     remote = shlex.split(plan.argv[6])
     assert remote[:2] == ["bash", "-c"]
     assert "do" not in remote[2].split() or "for " not in remote[2]
-    assert "/Users/alex/app" in remote
+    assert "/Users/dev/app" in remote
     assert "fix it" in remote
     assert "cd /Users" not in plan.argv[4]
 
@@ -103,8 +103,8 @@ def test_terminal_harnesses_do_not_skip_approval():
     assert "--trust" not in code.argv
     pi = plan_run("pi", "fix the test")
     assert pi.argv[:2] == ["pi", "--print"]
-    orca = plan_run("orca", "ping", worktree="path:/Users/alex/Projects/app")
-    assert orca.argv[orca.argv.index("--worktree") + 1] == "path:/Users/alex/Projects/app"
+    orca = plan_run("orca", "ping", worktree="path:/Users/dev/Projects/app")
+    assert orca.argv[orca.argv.index("--worktree") + 1] == "path:/Users/dev/Projects/app"
     assert "--host" not in orca.argv
     generic = plan_run("worker", "fix the test", prompt_flag="-p")
     assert generic.argv == ["worker", "-p", "fix the test"]
@@ -321,13 +321,13 @@ def test_remote_peek_does_not_diff_this_machine():
             "status": "running",
             "pid": 1,
             "log": str(log),
-            "cwd": "/Users/alex/src/hermes-captain",
-            "host": "alex@100.72.158.127",
+            "cwd": "/Users/dev/src/hermes-captain",
+            "host": "dev@203.0.113.7",
         }), encoding="utf-8")
         card = Captain(root, spawn=lambda *a: 1, capture=capture, diff=local_diff).peek("abc")
     assert card["diff"] == "?? REVIEW.md"
     assert seen["argv"][0] == "ssh"
-    assert "alex@100.72.158.127" in seen["argv"]
+    assert "dev@203.0.113.7" in seen["argv"]
 
 
 def test_stderr_does_not_break_the_thread_id():
@@ -371,7 +371,7 @@ def test_remote_cli_stop_does_not_pretend():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         (root / "abc.json").write_text(json.dumps({
-            "id": "abc", "agent": "claude", "pid": 1, "host": "alex@100.72.158.127", "status": "running",
+            "id": "abc", "agent": "claude", "pid": 1, "host": "dev@203.0.113.7", "status": "running",
         }), encoding="utf-8")
         result = Captain(root, spawn=lambda *a: 1, capture=lambda *a: {"code": 0, "stdout": ""}).stop("abc")
     assert result["ok"] is False
@@ -498,7 +498,7 @@ def test_t3_timeout_on_stderr_keeps_waiting():
 
 
 HANDLE = "thread:delegated-task:command%3Amcp%3A58968731-a581-4993-8fff-3cb51a5a132e%3Adelegate-task%3A2490cc31"
-MAC = "alex@100.72.158.127"
+MAC = "dev@203.0.113.7"
 
 
 ANSWER = "Fixed the bug. 3 tests pass."
@@ -510,7 +510,7 @@ def _read_envelope(answer=ANSWER):
         "runtime": {"origin": "http://127.0.0.1:3773", "serverVersion": "0.1.7", "capabilities": {"threadStop": True}},
         "auth": {"source": "desktop"},
         "snapshotSequence": 60080,
-        "project": {"id": "p1", "title": "caas", "workspaceRoot": "/Users/alex/Projects/caas"},
+        "project": {"id": "p1", "title": "caas", "workspaceRoot": "/Users/dev/Projects/caas"},
         "thread": {
             "id": "mcp:58968731-a581-4993-8fff-3cb51a5a132e", "title": "Lane 4", "runStatus": "idle",
             "turns": [{"index": 1, "turnId": "run:1", "state": "completed", "finalMessageId": "message:provider:2"}],
@@ -930,7 +930,7 @@ def test_build_prompt_gives_the_structure():
     from hermes_captain.plan import build_prompt
     prompt = build_prompt("make login redirect", ["app/login.py", "tests/test_login.py"], "pytest tests/test_login.py passes")
     for part in ("Goal: make login redirect", "- app/login.py", "- tests/test_login.py", "Done when: pytest tests/test_login.py passes",
-                 "smallest change that works", "No extra features", "No new dependencies", "short final answer: what changed, and what is left"):
+                 "smallest change that works", "No extra features", "No new dependencies", "final answer under 100 words: what changed, the verify output, what is left"):
         assert part in prompt, part
     bare = build_prompt("fix it")
     assert "Files in scope" not in bare and "Done when" not in bare and "smallest change" in bare
@@ -970,7 +970,7 @@ def test_conductor_run_builds_the_kickoff_and_keeps_the_free_form_path():
         none = json.loads(entry._run({"agent": "t3"}))
         no_goal = json.loads(entry._run({"agent": "t3", "files": ["a.py"]}))
     assert built["ok"] and free["ok"]
-    assert seen[0].startswith("Goal: fix login") and "- a.py" in seen[0] and "Done when: tests pass" in seen[0]
+    assert "Goal: fix login" in seen[0] and "- a.py" in seen[0] and "Done when: tests pass" in seen[0]
     assert seen[1] == "just do the thing"
     assert none == {"ok": False, "error": "goal is missing"} == no_goal
     assert len(seen) == 2
@@ -1399,12 +1399,365 @@ def test_resume_nudge_wording_follows_the_mode_and_the_cap():
     assert "conductor_run (agent claude, continue true, cwd /work)" in sent[0] and "conductor_steer" not in sent[0]
 
 
+def _push_wait(root, argv, events, before_exit=None, host=None, capture=None):
+    """A real child with a push-wired record. `before_exit` runs on a thread while the child is still alive."""
+    import threading
+    from hermes_captain.runner import _spawn
+    captain = Captain(root, capture=capture)
+    captain.events_dir = root / "events"
+    captain.events_dir.mkdir()
+    captain.health_every = 100
+    sent = []
+    captain.notify = lambda run_id, record: sent.append(record["message"]) or True
+    pid = _spawn(argv, None, root / "run.log")
+    proc = getattr(_spawn, "_last", None)
+    captain._procs[pid] = proc
+    record = {"id": "abc", "pid": pid, "surface": "cli", "agent": "claude", "status": "running",
+              "title": "beta", "log": str(root / "run.log"), "events": events}
+    if host:
+        record["host"] = host
+    (root / "abc.json").write_text(json.dumps(record), encoding="utf-8")
+    if before_exit:
+        threading.Timer(0.5, before_exit, args=(captain.events_dir,)).start()
+    captain.arm_wait("abc")
+    done = captain.wait_done("abc", timeout=8)
+    alive = proc.poll() is None
+    if alive:
+        proc.kill()
+    proc.wait()
+    return captain, done, sent, alive
+
+
+def _event(kind, message=""):
+    return json.dumps({"agent": "claude", "kind": kind, "time": 1, "message": message})
+
+
+def test_an_event_file_wakes_the_wait_before_the_process_exits_and_is_deleted():
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        write = lambda d: (d / "abc.done.json").write_text(_event("done", "Shipped it."), encoding="utf-8")
+        _, done, sent, alive = _push_wait(root, ["sleep", "30"], "push", before_exit=write)
+        left = list((root / "events").iterdir())
+    assert alive, "the wait should have ended while the agent was still running"
+    assert done["ping"] == "done" and done["seconds"] < 5
+    assert len(sent) == 1 and "finished" in sent[0] and "Shipped it." in sent[0]
+    assert left == []
+    with tempfile.TemporaryDirectory() as tmp:
+        write = lambda d: (d / "abc.needs-input.json").write_text(_event("needs-input", "Claude needs your permission to use Bash"), encoding="utf-8")
+        captain, done, sent, alive = _push_wait(Path(tmp), ["sleep", "30"], "push", before_exit=write)
+        saved = json.loads((Path(tmp) / "abc.json").read_text())
+    assert alive and done["ping"] == "needs-attention"
+    assert "approval" in sent[0] and "needs your permission to use Bash" in sent[0] and "Do not steer" in sent[0]
+    assert saved["event"] == "needs-input"
+
+
+def test_broken_missing_or_unwired_hooks_fall_back_to_polling():
+    import tempfile
+    quick = ["python3", "-c", "import time; time.sleep(1.5)"]
+    with tempfile.TemporaryDirectory() as tmp:  # push wired, the hook never fired
+        _, done, sent, _ = _push_wait(Path(tmp), quick, "push")
+    assert done["ping"] == "done" and len(sent) == 1 and "finished" in sent[0]
+    with tempfile.TemporaryDirectory() as tmp:  # the hook wrote garbage: ignored, and not left behind
+        root = Path(tmp)
+        junk = lambda d: (d / "abc.done.json").write_text("{not json", encoding="utf-8")
+        _, done, sent, alive = _push_wait(root, quick, "push", before_exit=junk)
+        left = list((root / "events").iterdir())
+    assert not alive and done["ping"] == "done" and done["seconds"] >= 1.0  # the exit ended it, not the junk
+    assert len(sent) == 1 and left == []
+    with tempfile.TemporaryDirectory() as tmp:  # an unwired agent never looks at the folder
+        real = lambda d: (d / "abc.done.json").write_text(_event("done"), encoding="utf-8")
+        _, done, _, alive = _push_wait(Path(tmp), quick, "polling", before_exit=real)
+    assert not alive and done["seconds"] >= 1.0
+
+
+def test_remote_event_wait_is_one_ssh_command_that_wakes_the_wait():
+    import shlex
+    import subprocess
+    import tempfile
+    import time
+    from hermes_captain.plan import plan_event_wait
+    argv = plan_event_wait("abc", MAC, 60).argv
+    assert argv[:3] == ["ssh", "-o", "BatchMode=yes"] and MAC in argv
+    remote = shlex.split(argv[-1])
+    script = remote[-1]
+    for part in ("test -e", 'cat "$f"', "rm -f", ".conductor/events", "abc.$k.json", "-ge 60", "sleep 1"):
+        assert part in script, part
+    try:
+        plan_event_wait("../x", MAC, 60)
+    except PlanError:
+        pass
+    else:
+        raise AssertionError("bad run id accepted")
+    with tempfile.TemporaryDirectory() as tmp:  # run the very script ssh would run
+        folder = Path(tmp)
+        env = {"PATH": "/usr/bin:/bin", "CONDUCTOR_EVENTS": str(folder)}
+        (folder / "abc.done.json").write_text(_event("done", "ok"), encoding="utf-8")
+        (folder / "abc.needs-input.json").write_text(_event("needs-input"), encoding="utf-8")
+        got = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+        assert got.returncode == 0 and json.loads(got.stdout)["kind"] == "done"
+        assert list(folder.iterdir()) == []
+        start = time.time()
+        short = shlex.split(plan_event_wait("abc", MAC, 1).argv[-1])[-1]
+        none = subprocess.run(["bash", "-c", short], env=env, capture_output=True, text=True)
+        assert none.returncode == 6 and none.stdout == "" and 1 <= time.time() - start < 4
+    seen = []
+
+    def capture(argv, cwd, timeout):
+        seen.append((argv, timeout))
+        return {"code": 0, "stdout": _event("done", "from the mac"), "stderr": ""}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _, done, sent, alive = _push_wait(Path(tmp), ["sleep", "30"], "push", host=MAC, capture=capture)
+    assert alive and done["ping"] == "done" and "from the mac" in sent[0]
+    assert seen[0][0][0] == "ssh" and MAC in seen[0][0] and "test -e" in seen[0][0][-1] and seen[0][1] == 75
+
+
+def _run_hook(command, env, stdin="", extra=()):
+    import subprocess
+    return subprocess.run(command, shell=isinstance(command, str), input=stdin, env=env, capture_output=True, text=True, timeout=20)
+
+
+def test_claude_gets_per_run_settings_with_only_our_two_hooks():
+    import os
+    import tempfile
+    assert plan_run("claude", "x").argv == ["claude", "-p", "x"]  # no run, no wiring
+    plan = plan_run("claude", "x", run_id="abc", model="sonnet")
+    assert plan.push == "push"
+    assert plan.argv[:4] == ["env", "CONDUCTOR_RUN=abc", "claude", "--settings"]
+    assert plan.argv[5:] == ["--model", "sonnet", "-p", "x"]
+    settings = json.loads(plan.argv[4])
+    assert list(settings) == ["hooks"] and set(settings["hooks"]) == {"Stop", "PermissionRequest", "Notification"}
+    commands = {h["command"] for groups in settings["hooks"].values() for g in groups for h in g["hooks"]}
+    assert len(commands) == 2
+    assert {c.rsplit(" ", 1)[1] for c in commands} == {"done", "needs-input"}
+    assert {c.split(" -c ")[0] for c in commands} == {"python3"}
+    everything = " ".join(plan.argv)
+    for theirs in (".claude", "settings.json", ".codex", ".cursor", "hooks.json", "setting-sources", "/Users/"):
+        assert theirs not in everything, theirs
+    stop = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+    with tempfile.TemporaryDirectory() as tmp:  # the quoted command really runs, and reads stdin
+        env = {**os.environ, "CONDUCTOR_RUN": "abc", "CONDUCTOR_EVENTS": tmp}
+        _run_hook(stop, env, stdin=json.dumps({"hook_event_name": "Stop", "last_assistant_message": "All done"}))
+        event = json.loads((Path(tmp) / "abc.done.json").read_text())
+        ask = settings["hooks"]["Notification"][0]["hooks"][0]["command"]
+        _run_hook(ask, env, stdin=json.dumps({"message": "Claude needs your permission"}))
+        asked = json.loads((Path(tmp) / "abc.needs-input.json").read_text())
+        assert sorted(p.name for p in Path(tmp).iterdir()) == ["abc.done.json", "abc.needs-input.json"]
+    assert event["kind"] == "done" and event["agent"] == "claude" and event["message"] == "All done"
+    assert asked["kind"] == "needs-input" and asked["message"] == "Claude needs your permission"
+
+
+def test_codex_gets_a_notify_override_for_done_only():
+    import os
+    import tempfile
+    import tomllib
+    assert plan_run("codex", "x").argv == ["codex", "exec", "x"]
+    plan = plan_run("codex", "fix it", run_id="abc")
+    assert plan.push == "push (done only)"
+    assert plan.argv[:5] == ["env", "CONDUCTOR_RUN=abc", "codex", "exec", "-c"] and plan.argv[-1] == "fix it"
+    assert plan.argv[5].startswith("notify=[")
+    notify = tomllib.loads(plan.argv[5])["notify"]  # valid TOML, so codex can parse it
+    assert notify[:2] == ["python3", "-c"] and notify[-2:] == ["codex", "done"]
+    assert not any(b in _flags(plan.argv) for b in BANNED)
+    with tempfile.TemporaryDirectory() as tmp:  # codex appends its JSON as the last argument
+        env = {**os.environ, "CONDUCTOR_RUN": "abc", "CONDUCTOR_EVENTS": tmp}
+        payload = json.dumps({"type": "agent-turn-complete", "last-assistant-message": "Fixed."})
+        _run_hook([*notify, payload], env)
+        event = json.loads((Path(tmp) / "abc.done.json").read_text())
+    assert event["kind"] == "done" and event["agent"] == "codex" and event["message"] == "Fixed."
+
+
+def test_the_hook_script_never_fails_the_agent_or_writes_outside_the_folder():
+    import os
+    import sys
+    import tempfile
+    script = ROOT / "notify_hook.py"
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = Path(tmp) / "events"
+        base = {**os.environ, "CONDUCTOR_EVENTS": str(folder)}
+        for env, args, stdin in (
+            ({**base}, ["claude", "done"], "{broken"),  # no run id, bad json
+            ({**base, "CONDUCTOR_RUN": "../escape"}, ["claude", "done"], "{}"),
+            ({**base, "CONDUCTOR_RUN": "abc"}, ["claude", "explode"], "{}"),
+        ):
+            done = _run_hook([sys.executable, str(script), *args], env, stdin=stdin)
+            assert done.returncode == 0 and done.stdout == "", args
+        assert not folder.exists() or list(folder.iterdir()) == []
+        assert not (Path(tmp) / "escape.done.json").exists()
+        long = json.dumps({"message": "x" * 5000 + "THE END"})
+        _run_hook([sys.executable, str(script), "claude", "done"], {**base, "CONDUCTOR_RUN": "abc"}, stdin=long)
+        event = json.loads((folder / "abc.done.json").read_text())
+    assert len(event["message"]) == 1500 and event["message"].endswith("THE END")
+
+
+def test_cursor_recipe_has_no_bypass_flag_and_is_polling_only():
+    plan = plan_run("cursor", "fix the test")
+    assert plan.argv == ["cursor-agent", "--print", "fix the test"]
+    assert plan.push == "polling" and plan.mode == "background"
+    for flag in ("--force", "-f", "--yolo", "--trust", "--approve-mcps", "--auto-review"):
+        assert flag not in plan.argv
+    assert plan_run("cursor-agent", "x").argv[0] == "cursor-agent"
+    assert plan_run("cursor", "x", run_id="abc").argv == ["cursor-agent", "--print", "x"]  # nothing to wire
+    try:
+        plan_run("cursor", "--yolo do it")
+    except PlanError:
+        pass
+    else:
+        raise AssertionError("a prompt could smuggle in a flag")
+
+
+def test_run_labels_how_each_agent_reports_back():
+    import tempfile
+    spawned = []
+    with tempfile.TemporaryDirectory() as tmp:
+        captain = Captain(Path(tmp), spawn=lambda argv, cwd, log: spawned.append(argv) or 0,
+                          capture=lambda *a: {"code": 0, "stdout": "{}", "error": ""})
+        labels = {a: captain.run(a, "x")["events"] for a in ("claude", "codex", "cursor", "grok", "hermes", "t3")}
+        record = captain.run("claude", "x")
+    assert labels == {"claude": "push", "codex": "push (done only)", "cursor": "polling",
+                      "grok": "polling", "hermes": "polling", "t3": "polling"}
+    assert spawned[0][:2] == ["env", f"CONDUCTOR_RUN={spawned[0][1].split('=')[1]}"]
+    assert f"CONDUCTOR_RUN={record['id']}" in spawned[-1]  # the hook's run id is the run's id
+
+
+STOP = "If you are blocked or the goal is unclear, stop and say exactly what you need. Do not guess and do not widen the scope."
+
+
+def test_verify_command_is_run_and_reported_before_done():
+    from hermes_captain.plan import build_prompt
+    prompt = build_prompt("fix login", ["a.py"], "the redirect works", verify="pytest -q tests/test_login.py")
+    assert "Verify: run `pytest -q tests/test_login.py`. Fix the work until it passes, then report its real output." in prompt
+    assert prompt.index("Verify:") < prompt.index("Done when:")
+    none = build_prompt("fix login", ["a.py"])
+    assert "find the project's test command first, run it" in none and "report its real output" in none
+    assert "`" not in none
+
+
+def test_a_tiny_task_gets_a_tiny_prompt():
+    from hermes_captain.plan import compose_prompt
+    prompt, parts = compose_prompt("fix the typo on line 3", ["README.md"], "the typo is gone", verify="grep -c teh README.md", agent="claude")
+    assert len(prompt.splitlines()) <= 10 and len(prompt) < 650, prompt
+    assert "Read the relevant code first" not in prompt and "explore" not in parts
+    for padding in ("Context:", "Never touch", "skills", "subagents"):
+        assert padding not in prompt
+    assert parts == ["rules", "stop", "final_answer", "goal", "files", "verify", "done_when"]
+
+
+def test_empty_files_or_a_long_goal_adds_the_explore_line():
+    from hermes_captain.plan import compose_prompt
+    line = "Read the relevant code first and state your plan in 3 lines before editing."
+    prompt, parts = compose_prompt("add rate limiting to the api")
+    assert line in prompt and "explore" in parts
+    assert prompt.rstrip().endswith(line)  # last, right before the agent starts editing
+    assert line in compose_prompt("x" * 301, ["a.py"])[0]
+    assert line not in compose_prompt("x" * 300, ["a.py"])[0]
+    assert line not in compose_prompt("add rate limiting", ["api.py"])[0]
+
+
+def test_context_is_short_and_avoid_is_a_plain_list():
+    from hermes_captain.plan import build_prompt
+    prompt = build_prompt("fix login", ["app/login.py"], context="line one\nline two\nline three\nline four", avoid=["migrations/", ".env"])
+    assert "Context: line one\nline two\nline three\n" in prompt and "line four" not in prompt
+    assert prompt.index("Context:") < prompt.index("Files in scope:")
+    assert "Never touch: migrations/, .env." in prompt
+    assert "Never touch" not in build_prompt("fix login", ["a.py"])
+    assert "Never touch: .env." in build_prompt("fix login", ["a.py"], avoid=".env")
+
+
+def test_no_shouting_in_the_prompt():
+    import re
+    from hermes_captain.plan import build_prompt
+    prompt = build_prompt("fix login", ["a.py"], "works", verify="pytest", context="why", avoid=["x"], skills=["tdd"], agent="claude")
+    assert not re.search(r"\b[A-Z]{3,}\b", prompt) and "!" not in prompt and "important" not in prompt.lower()
+
+
+def test_skills_line_is_only_for_claude_and_codex_and_only_when_given():
+    from hermes_captain.plan import build_prompt
+    claude = build_prompt("fix login", ["a.py"], skills=["tdd", "review"], agent="claude")
+    assert "Use these skills if they are installed: tdd, review." in claude
+    assert "If pieces are independent, use parallel subagents." in claude
+    assert "Use these skills" in build_prompt("fix login", ["a.py"], skills="tdd", agent="Claude-Code")
+    codex = build_prompt("fix login", ["a.py"], skills=["tdd"], agent="codex")
+    assert "Follow AGENTS.md. Apply these skills if it lists them: tdd." in codex and "subagents" not in codex
+    for agent in ("claude", "codex"):  # nothing given, nothing said
+        quiet = build_prompt("fix login", ["a.py"], agent=agent)
+        assert not any(w in quiet.lower() for w in ("skill", "subagent", "agents.md"))
+    for agent in ("cursor", "hermes", "grok", "opencode", "t3", "mystery-agent", ""):
+        other = build_prompt("fix login", ["a.py"], skills=["tdd", "review"], agent=agent)
+        assert not any(w in other.lower() for w in ("skill", "subagent", "agents.md", "tdd")), agent
+
+
+def test_the_stop_condition_is_always_there():
+    from hermes_captain.plan import build_prompt
+    for kwargs in (dict(), dict(files=["a.py"]), dict(files=["a.py"], verify="make", skills=["x"], agent="claude"), dict(agent="codex", avoid=["y"])):
+        assert STOP in build_prompt("fix login", **kwargs), kwargs
+    assert STOP not in build_prompt("fix login", delta=True)  # a continue already has it
+
+
+def test_stable_text_comes_first_and_the_task_last():
+    from hermes_captain.plan import build_prompt
+    a = build_prompt("fix login", ["a.py"], "works", verify="pytest", context="old code", avoid=["x"])
+    b = build_prompt("add export button", ["b.py", "c.py"], "button shows", verify="npm test", context="new ui")
+    rules, stop, final = a.index("One rule"), a.index("If you are blocked"), a.index("End with a final answer")
+    assert rules < stop < final < a.index("Context:") < a.index("Goal:") < a.index("Files in scope:") < a.index("Verify:") < a.index("Done when:")
+    assert a.split("\n\n")[0] == b.split("\n\n")[0]  # the same opening for every task, so the cache can be reused
+    assert "fix login" not in a.split("\n\n")[0]
+
+
+def test_a_continue_sends_only_the_delta_and_a_steer_is_passed_through():
+    import tempfile
+    from hermes_captain.plan import compose_prompt
+    full, full_parts = compose_prompt("now handle logout", ["a.py"], verify="pytest", agent="claude", skills=["tdd"])
+    delta, delta_parts = compose_prompt("now handle logout", ["a.py"], verify="pytest", agent="claude", skills=["tdd"], delta=True)
+    assert "One rule" in full and "rules" in full_parts
+    for repeated in ("One rule", "No new dependencies", "If you are blocked", "final answer", "skills", "Read the relevant code"):
+        assert repeated not in delta, repeated
+    assert "Goal: now handle logout" in delta and "Verify: run `pytest`" in delta
+    assert not {"rules", "stop", "final_answer", "skills"} & set(delta_parts)
+    spawned = []
+    entry = _entry()
+    with tempfile.TemporaryDirectory() as tmp:
+        entry._CAPTAIN = Captain(Path(tmp), spawn=lambda argv, cwd, log: spawned.append(argv) or 0)
+        entry._run({"agent": "claude", "goal": "first task", "files": ["a.py"]})
+        entry._run({"agent": "claude", "continue": True, "goal": "now handle logout", "files": ["a.py"]})
+    assert "One rule" in spawned[0][-1] and "--continue" in spawned[1]
+    assert spawned[1][-1].startswith("Goal: now handle logout") and "One rule" not in spawned[1][-1]
+    with tempfile.TemporaryDirectory() as tmp:
+        captain, calls = _t3_captain(Path(tmp), [])
+        captain.steer("abc", "also cover the empty case")
+    sent = [a[-1] for a in calls if "--if-busy" in a[-1]][0]
+    assert "also cover the empty case" in sent and "One rule" not in sent and "final answer" not in sent
+
+
+def test_conductor_run_reports_the_prompt_it_sent():
+    import tempfile
+    seen = []
+    entry = _entry()
+    with tempfile.TemporaryDirectory() as tmp:
+        entry._CAPTAIN = Captain(Path(tmp), capture=lambda argv, c, t: seen.append(argv[argv.index("--prompt") + 1]) or {"code": 0, "stdout": "{}", "error": ""})
+        built = json.loads(entry._run({"agent": "t3", "goal": "fix login", "files": ["a.py"], "verify": "pytest", "avoid": ["x"], "context": "why"}))
+        free = json.loads(entry._run({"agent": "t3", "prompt": "just do it"}))
+        no_goal = json.loads(entry._run({"agent": "t3", "verify": "pytest"}))
+    assert built["prompt"]["lines"] == len(seen[0].splitlines())
+    assert built["prompt"]["parts"] == ["rules", "stop", "final_answer", "context", "goal", "files", "avoid", "verify"]
+    assert free["prompt"] == {"lines": 1, "parts": ["free-form"]}
+    assert no_goal == {"ok": False, "error": "goal is missing"}
+
+
 def test_run_records_last_active():
     import tempfile
     import time
     with tempfile.TemporaryDirectory() as tmp:
         record = Captain(Path(tmp), capture=lambda *a: {"code": 0, "stdout": "{}", "error": ""}).run("t3", "review")
     assert abs(record["last_active"] - time.time()) < 5
+
+
+def test_a_continue_never_repeats_the_plan_first_line():
+    from hermes_captain.plan import build_prompt
+    assert "state your plan" in build_prompt("add rate limiting")
+    assert "state your plan" not in build_prompt("add rate limiting", delta=True)
+    assert "One rule" not in build_prompt("add rate limiting", delta=True)
 
 
 if __name__ == "__main__":

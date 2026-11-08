@@ -7,7 +7,7 @@ import logging
 
 from pathlib import Path
 
-from .plan import PlanError, build_prompt
+from .plan import PlanError, compose_prompt
 from .runner import Captain
 
 logger = logging.getLogger(__name__)
@@ -44,9 +44,14 @@ def _doctor(args, **kwargs):
 def _run(args, **kwargs):
     args = args or {}
     try:
-        prompt = str(args.get("prompt") or "")
-        if args.get("goal") or args.get("files") or args.get("done_when") or not prompt.strip():
-            prompt = build_prompt(str(args.get("goal") or ""), args.get("files"), str(args.get("done_when") or ""))
+        prompt, parts = str(args.get("prompt") or ""), ["free-form"]
+        if not prompt.strip() or any(args.get(k) for k in ("goal", "files", "done_when", "verify", "context", "avoid", "skills")):
+            prompt, parts = compose_prompt(
+                str(args.get("goal") or ""), args.get("files"), str(args.get("done_when") or ""),
+                verify=str(args.get("verify") or ""), context=str(args.get("context") or ""),
+                avoid=args.get("avoid"), skills=args.get("skills"),
+                agent=str(args.get("agent") or ""), delta=bool(args.get("continue")),
+            )
         record = _captain().run(
             str(args.get("agent") or ""),
             prompt,
@@ -64,7 +69,7 @@ def _run(args, **kwargs):
             card=str(args.get("card") or "") or None,
             session_key=str(kwargs.get("session_id") or kwargs.get("session_key") or ""),
         )
-        return _ok({"run": record})
+        return _ok({"run": record, "prompt": {"lines": len(prompt.splitlines()), "parts": parts}})
     except PlanError as exc:
         return _err(exc)
     except Exception as exc:
@@ -174,10 +179,14 @@ _SCHEMAS = {
         "parameters": {
             "type": "object",
             "properties": {
-                "agent": {"type": "string", "description": "hermes, claude, codex, grok, opencode, pycode, orca, t3, or another terminal command name. Unknown commands need prompt_flag."},
+                "agent": {"type": "string", "description": "hermes, claude, codex, grok, cursor, opencode, pycode, orca, t3, or another terminal command name. Unknown commands need prompt_flag. The run record's events field says how it reports back: push (claude), push (done only) (codex), or polling (everything else, including T3, which waits on t3code)."},
                 "prompt_flag": {"type": "string", "description": "For an unknown terminal agent only: -p, --print, or --prompt. No other flags are accepted."},
-                "goal": {"type": "string", "description": "What the agent should achieve. Conductor builds the kickoff from goal, files, and done_when, so do not write the structure yourself. Wins over prompt."},
-                "files": {"type": "array", "items": {"type": "string"}, "description": "Files or folders in scope."},
+                "goal": {"type": "string", "description": "One outcome for this run. Conductor builds the kickoff from goal, context, files, avoid, verify, and done_when, so pass them every time and do not write the structure yourself. Wins over prompt. With continue, only the task part is sent, never the rules again."},
+                "context": {"type": "string", "description": "1-3 lines: why, and what already exists. Not a repo dump."},
+                "files": {"type": "array", "items": {"type": "string"}, "description": "Files or folders in scope. Empty makes the agent read first and state a plan."},
+                "avoid": {"type": "array", "items": {"type": "string"}, "description": "Paths or areas the agent must not touch."},
+                "verify": {"type": "string", "description": "The exact command that proves the work (tests, build, lint). The agent runs it and fixes until it passes. Omit and it finds the project's test command."},
+                "skills": {"type": "array", "items": {"type": "string"}, "description": "Skill names the agent should use. Only claude and codex are told. Never invent a name."},
                 "done_when": {"type": "string", "description": "What done looks like, checkable."},
                 "prompt": {"type": "string", "description": "Free-form task, only when goal does not fit."},
                 "cwd": {"type": "string", "description": "Absolute project directory. On a remote host it is passed as an argument, not a shell string."},
@@ -237,7 +246,7 @@ _SCHEMAS = {
             "type": "object",
             "properties": {
                 "run_id": {"type": "string"},
-                "prompt": {"type": "string"},
+                "prompt": {"type": "string", "description": "Only what changed since the last turn. Never re-send the rules, the file list, or the repo."},
             },
             "required": ["run_id", "prompt"],
         },

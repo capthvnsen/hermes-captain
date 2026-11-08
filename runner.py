@@ -30,8 +30,10 @@ from .peek import (
     thread_failure,
 )
 from .plan import (
+    EVENT_KINDS,
     HOST_RE,
     PlanError,
+    plan_event_wait,
     plan_inspect,
     plan_list,
     plan_read,
@@ -69,6 +71,7 @@ class Captain:
         self.notify = None
         self.retry_delay = 5
         self.health_every = 30
+        self.events_dir = Path(os.environ.get("CONDUCTOR_EVENTS") or Path.home() / ".conductor" / "events")
         self._kanban_threads: list[threading.Thread] = []
         self._kanban_logged = False
         self._supervise_stop = threading.Event()
@@ -120,8 +123,8 @@ class Captain:
         card = str(kwargs.pop("card", "") or "")
         if card and not CARD_RE.fullmatch(card):
             raise PlanError("card must be a plain task id")
-        plan = plan_run(agent, prompt, **kwargs)
         run_id = uuid.uuid4().hex[:12]
+        plan = plan_run(agent, prompt, run_id=run_id, **kwargs)
         record = {
             "id": run_id,
             "agent": plan.name or agent,
@@ -133,6 +136,7 @@ class Captain:
             "cwd": kwargs.get("cwd") or "",
             "keep": keep,
             "last_active": time.time(),
+            "events": plan.push,
         }
         if session_key:
             record["session_key"] = session_key
@@ -353,11 +357,13 @@ class Captain:
         except PlanError:
             return
         ping = "done"
-        code = None
+        code, event = None, None
         if record.get("surface") == "t3" and record.get("handle"):
             ping = self._wait_t3(record)
         elif record.get("pid"):
-            code = self._wait_pid(run_id, record["pid"])
+            code, event = self._wait_pid(run_id, record["pid"])
+            if event and event.get("kind") == "needs-input":
+                ping = "needs-attention"
         else:
             ping = "no process to wait on"
         try:
@@ -366,6 +372,9 @@ class Captain:
             return
         if code and fresh.get("status") != "stopped":  # our own SIGTERM is not a crash
             fresh["exit_code"] = code
+        if event:
+            fresh["event"] = event["kind"]
+            fresh["event_message"] = str(event.get("message") or "")[-MAX_RESULT:]
         fresh["status"] = "exited" if ping in ("done", "errored") else fresh.get("status")
         fresh["ping"] = ping
         fresh["pinged_at"] = fresh["last_active"] = time.time()
@@ -373,16 +382,64 @@ class Captain:
         self._save(run_id, fresh)
         self._deliver(run_id, fresh)
 
-    def _wait_pid(self, run_id: str, pid: int) -> int | None:
-        """Block until the process exits, checking health on the way. The exit code, when we are its parent."""
+    def _wait_pid(self, run_id: str, pid: int) -> tuple[int | None, dict | None]:
+        """Block until the process exits or the agent's own hook reports, checking health on the way.
+        Returns the exit code (when we are its parent) and the event, if one woke us."""
+        record = self._load(run_id)
+        pushed = record.get("events", "polling") != "polling"
+        found: list[dict] = []
+        stop = threading.Event()
+        if pushed:
+            threading.Thread(target=self._pull_event, args=(record, found, stop), daemon=True).start()
         last = time.time()
-        while self._running(pid):
-            time.sleep(0.2)
-            if time.time() - last >= self.health_every:
-                last = time.time()
-                self._tick(run_id)
+        try:
+            while self._running(pid) and not found:
+                time.sleep(0.2)
+                if time.time() - last >= self.health_every:
+                    last = time.time()
+                    self._tick(run_id)
+        finally:
+            stop.set()
+        if pushed and not found:
+            self._take_event(record)  # the process won the race: still clear the file the hook left
         proc = self._procs.get(int(pid))
-        return proc.returncode if proc is not None else None
+        return (proc.returncode if proc is not None else None), (found[0] if found else None)
+
+    def _pull_event(self, record: dict, found: list, stop: threading.Event) -> None:
+        remote = bool(record.get("host"))
+        while not stop.is_set() and not found:
+            try:
+                event = self._take_event(record, 60 if remote else 0)
+            except Exception:
+                logger.exception("conductor event wait")
+                event = None
+            if event:
+                found.append(event)
+                return
+            stop.wait(1 if remote else 0.2)
+
+    def _take_event(self, record: dict, seconds: int = 0) -> dict | None:
+        """Look for the run's event file, wait up to `seconds` if it is on another machine. Reads it, deletes it.
+        A broken file is deleted and ignored, so polling carries on."""
+        run_id = record["id"]
+        if record.get("host"):
+            got = self.capture(plan_event_wait(run_id, record["host"], seconds).argv, None, seconds + 15)
+            text = got.get("stdout") or ""
+        else:
+            text = ""
+            for kind in EVENT_KINDS:
+                try:
+                    text = (self.events_dir / f"{run_id}.{kind}.json").read_text(encoding="utf-8")
+                    break
+                except OSError:
+                    continue
+            for path in self.events_dir.glob(f"{run_id}.*.json"):
+                path.unlink(missing_ok=True)
+        try:
+            event = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        return event if isinstance(event, dict) and event.get("kind") in EVENT_KINDS else None
 
     def _health(self, record: dict, output: str, alive: bool, stuck: bool, thread: dict) -> tuple[str, str]:
         state = thread.get("runStatus")
@@ -529,6 +586,9 @@ class Captain:
             failure = thread_failure(thread) or ("the thread run failed" if ping == "errored" else "")
         elif record.get("log") and Path(record["log"]).exists():
             result = Path(record["log"]).read_text(encoding="utf-8", errors="replace").strip()
+        said = record.get("event_message") or ""
+        if said and (record.get("event") == "needs-input" or not result):
+            result = said
         if len(result) > MAX_RESULT:
             result = f"[first {len(result) - MAX_RESULT} characters cut]\n{result[-MAX_RESULT:]}"
         result = result or "(the agent returned no answer text)"
