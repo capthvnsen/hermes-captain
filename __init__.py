@@ -60,6 +60,7 @@ def _run(args, **kwargs):
             continue_session=bool(args.get("continue")),
             keep=bool(args.get("keep")),
             model=str(args.get("model") or "") or None,
+            mode=str(args.get("mode") or "") or None,
             session_key=str(kwargs.get("session_id") or kwargs.get("session_key") or ""),
         )
         return _ok({"run": record})
@@ -67,6 +68,16 @@ def _run(args, **kwargs):
         return _err(exc)
     except Exception as exc:
         logger.exception("captain run failed")
+        return _err(exc)
+
+
+def _mode(args, **kwargs):
+    del kwargs
+    try:
+        captain = _captain()
+        mode = str((args or {}).get("mode") or "")
+        return _ok({"mode": captain.set_mode(mode) if mode else captain.get_mode()})
+    except PlanError as exc:
         return _err(exc)
 
 
@@ -129,6 +140,12 @@ def handle_command(raw_args: str) -> str:
         if card.get("diff"):
             lines.append(card["diff"])
         return "\n".join(lines)
+    if raw.split()[:1] == ["mode"]:
+        arg = raw[4:].strip()
+        try:
+            return f"Mode: {_captain().set_mode(arg) if arg else _captain().get_mode()}"
+        except PlanError as exc:
+            return str(exc)
     host = raw or None
     report = _captain().doctor(host)
     lines = [f"Conductor on {report.get('host')}"]
@@ -171,8 +188,17 @@ _SCHEMAS = {
                 "continue": {"type": "boolean", "description": "Continue the last claude or grok session in this directory. Other agents refuse this."},
                 "keep": {"type": "boolean", "description": "When this run finishes, ping Hermes to give the next task. Only if the user still wants the work to continue."},
                 "model": {"type": "string", "description": "Plain model id for hermes, claude, or grok. Other agents refuse this. Not a price and not a bypass flag."},
+                "mode": {"type": "string", "enum": ["drive", "advise"], "description": "For this run only: overrides the saved mode. drive keeps steering until done; advise only recommends."},
             },
             "required": ["agent"],
+        },
+    },
+    "conductor_mode": {
+        "name": "conductor_mode",
+        "description": "Get or set what Conductor does when a run finishes and the goal is not met. drive: keep steering, at most 5 follow-ups per run. advise (default): recommend one next step and wait for the user. Only set it when the user asks.",
+        "parameters": {
+            "type": "object",
+            "properties": {"mode": {"type": "string", "enum": ["drive", "advise"], "description": "Omit to read the current mode."}},
         },
     },
     "conductor_read": {
@@ -281,13 +307,14 @@ def register(ctx):
     ctx.register_command(
         "conductor",
         handle_command,
-        description="Show which coding agents Conductor can reach. /conductor peek <run_id> checks a run without a model.",
-        args_hint="[ssh-host | peek <run_id>]",
+        description="Show which coding agents Conductor can reach. /conductor peek <run_id> checks a run without a model. /conductor mode [drive|advise] shows or sets what happens when a run finishes unmet.",
+        args_hint="[ssh-host | peek <run_id> | mode [drive|advise]]",
     )
     ctx.register_hook("transform_llm_output", _hold_status, hold_stream=True)
     handlers = {
         "conductor_doctor": _doctor,
         "conductor_run": _run,
+        "conductor_mode": _mode,
         "conductor_read": _read,
         "conductor_peek": _peek,
         "conductor_wait": _wait,

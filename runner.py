@@ -45,6 +45,8 @@ MAX_READ = 8000
 MAX_RESULT = 1500
 T3_POLL = 60  # seconds per T3 wait; the health check runs between waits
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+MODES = ("drive", "advise")
+MAX_ROUNDS = 5
 
 
 def default_data_dir() -> Path:
@@ -66,6 +68,19 @@ class Captain:
         self.retry_delay = 5
         self.health_every = 30
         self._supervise_stop = threading.Event()
+
+    def get_mode(self) -> str:
+        """drive or advise. advise unless the user chose drive: no surprise spend."""
+        try:
+            mode = json.loads((self.data_dir / "mode.json").read_text(encoding="utf-8")).get("mode")
+        except (OSError, json.JSONDecodeError, AttributeError):
+            return "advise"
+        return mode if mode in MODES else "advise"
+
+    def set_mode(self, mode: str) -> str:
+        mode = _check_mode(mode)
+        (self.data_dir / "mode.json").write_text(json.dumps({"mode": mode}) + "\n", encoding="utf-8")
+        return mode
 
     def doctor(self, host: str | None = None) -> dict:
         names = ("hermes", "claude", "codex", "grok", "opencode", "pycode", "orca", "t3code", "kimi", "pi", "commandcode")
@@ -96,6 +111,8 @@ class Captain:
     def run(self, agent: str, prompt: str, **kwargs) -> dict:
         keep = bool(kwargs.pop("keep", False))
         session_key = str(kwargs.pop("session_key", "") or "")
+        mode = kwargs.pop("mode", None)
+        mode = _check_mode(mode) if mode else None
         plan = plan_run(agent, prompt, **kwargs)
         run_id = uuid.uuid4().hex[:12]
         record = {
@@ -112,6 +129,8 @@ class Captain:
         }
         if session_key:
             record["session_key"] = session_key
+        if mode:
+            record["follow_mode"] = mode  # "mode" on the record is already the launch mode
         if plan.mode == "capture":
             result = self.capture(plan.argv, plan.cwd, 90)
             stdout = result.get("stdout") or ""
@@ -464,11 +483,27 @@ class Captain:
                 f"Tell the user now, in one line. What it last said:\n{result}\n"
                 "Do not start another run to retry unless the user says so."
             )
+        mode = record.get("follow_mode") or self.get_mode()
+        rounds = record.get("rounds") or 0
+        if mode == "advise":
+            then = (
+                "Then: if the user's goal is met, stop. If it is not, recommend one next step in one line and wait for the user. "
+                "Do not call conductor_steer or conductor_run."
+            )
+        elif rounds >= MAX_ROUNDS:
+            then = (
+                f"Then: stop. This run has used all {MAX_ROUNDS} follow-ups. Tell the user where it stands and wait. "
+                "Do not call conductor_steer or conductor_run."
+            )
+        else:
+            then = (
+                f"Then: if the user's goal is met, stop. If it is not, send one follow-up with conductor_steer on run {run_id} "
+                f"(round {rounds + 1} of {MAX_ROUNDS}). Stop and tell the user at once if the run is stalled, errored, "
+                "needs approval, or lost. Never start another run to get past an approval."
+            )
         return (
             f"Conductor: {name}{where} finished (run {run_id}). "
-            f"Message the user now with this result, in your own words:\n{result}\n"
-            f"Then: if the user's goal is met, stop. If it is not, send one follow-up with conductor_steer on run {run_id}. "
-            "Never start another run to get past an approval."
+            f"Message the user now with this result, in your own words:\n{result}\n{then}"
         )
 
     def _inspect(self, record: dict) -> str:
@@ -503,6 +538,7 @@ class Captain:
         result = self.capture(plan.argv, None, 60)
         if result.get("code") == 0:
             record["last_active"] = time.time()
+            record["rounds"] = (record.get("rounds") or 0) + 1
             self._save(run_id, record)
         return {"ok": result.get("code") == 0, "output": _clip(result.get("stdout") or result.get("error") or ""), **policy}
 
@@ -542,6 +578,13 @@ class Captain:
         if not path.exists():
             raise PlanError(f"no run {run_id}")
         return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _check_mode(mode: str) -> str:
+    mode = (mode or "").strip().lower()
+    if mode not in MODES:
+        raise PlanError("mode must be drive or advise")
+    return mode
 
 
 def _wait_outcome(stdout: str) -> str:

@@ -1051,6 +1051,115 @@ def test_interrupted_thread_is_errored_and_never_a_normal_finish():
         assert card["health"] == "errored" and card["note"] == "the run was interrupted"
 
 
+def _finish_text(saved=None, **extra):
+    """The finish message for a done T3 run, with the saved mode and any per-run fields."""
+    import tempfile
+    sent = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        captain, _ = _t3_captain(root, [COMPLETED])
+        record = json.loads((root / "abc.json").read_text())
+        (root / "abc.json").write_text(json.dumps({**record, **extra}), encoding="utf-8")
+        if saved:
+            captain.set_mode(saved)
+        captain.notify = lambda run_id, record: sent.append(record["message"]) or True
+        captain.arm_wait("abc")
+        captain.wait_done("abc", timeout=8)
+    return sent[0]
+
+
+def test_mode_defaults_to_advise_and_advise_sends_nothing():
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        assert Captain(Path(tmp)).get_mode() == "advise"
+    text = _finish_text()
+    assert "recommend one next step in one line" in text
+    assert "Do not call conductor_steer or conductor_run" in text
+    assert "send one follow-up" not in text and "round" not in text
+
+
+def test_drive_keeps_steering_and_counts_rounds():
+    text = _finish_text("drive")
+    assert "send one follow-up with conductor_steer on run abc (round 1 of 5)" in text
+    assert "stalled, errored, needs approval, or lost" in text
+    assert "round 3 of 5" in _finish_text("drive", rounds=2)
+    assert "round 5 of 5" in _finish_text("drive", rounds=4)
+
+
+def test_drive_stops_at_the_cap():
+    from hermes_captain.runner import MAX_ROUNDS
+    assert MAX_ROUNDS == 5
+    text = _finish_text("drive", rounds=MAX_ROUNDS)
+    assert "used all 5 follow-ups" in text and "Do not call conductor_steer or conductor_run" in text
+    assert "send one follow-up" not in text
+
+
+def test_per_run_mode_beats_the_saved_setting():
+    assert "send one follow-up" not in _finish_text("drive", follow_mode="advise")
+    assert "send one follow-up" in _finish_text("advise", follow_mode="drive")
+
+
+def test_mode_is_saved_and_a_bad_value_is_refused():
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        assert Captain(root).set_mode("Drive") == "drive"
+        assert Captain(root).get_mode() == "drive"  # a fresh process reads the file
+        for bad in ("yolo", "", "drive; advise"):
+            try:
+                Captain(root).set_mode(bad)
+            except PlanError as exc:
+                assert "drive or advise" in str(exc)
+            else:
+                raise AssertionError(f"{bad!r} was accepted")
+        assert Captain(root).get_mode() == "drive"
+        (root / "mode.json").write_text("not json", encoding="utf-8")
+        assert Captain(root).get_mode() == "advise"
+        try:
+            Captain(root, spawn=lambda *a: (_ for _ in ()).throw(AssertionError("spawned"))).run("claude", "x", mode="yolo")
+        except PlanError:
+            pass
+        else:
+            raise AssertionError("run accepted a bad mode")
+        saved = Captain(root, capture=lambda *a: {"code": 0, "stdout": "{}", "error": ""}).run("t3", "x", mode="drive")
+        plain = Captain(root, capture=lambda *a: {"code": 0, "stdout": "{}", "error": ""}).run("t3", "x")
+    assert saved["follow_mode"] == "drive" and "follow_mode" not in plain
+
+
+def test_steer_counts_a_round_only_when_it_is_sent():
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        captain, _ = _t3_captain(root, [])
+        captain.steer("abc", "one")
+        captain.steer("abc", "two")
+        assert json.loads((root / "abc.json").read_text())["rounds"] == 2
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        captain, _ = _t3_captain(root, [], pending=True)
+        captain.steer("abc", "blocked")
+        assert "rounds" not in json.loads((root / "abc.json").read_text())
+
+
+def test_mode_tool_and_slash_command():
+    import tempfile
+    entry = _entry()
+    with tempfile.TemporaryDirectory() as tmp:
+        entry._CAPTAIN = Captain(Path(tmp))
+        assert entry.handle_command("mode") == "Mode: advise"
+        assert entry.handle_command("mode drive") == "Mode: drive"
+        assert entry.handle_command("mode") == "Mode: drive"
+        assert "drive or advise" in entry.handle_command("mode yolo")
+        assert entry.handle_command("mode") == "Mode: drive"
+        assert json.loads(entry._mode({})) == {"ok": True, "mode": "drive"}
+        assert json.loads(entry._mode({"mode": "advise"})) == {"ok": True, "mode": "advise"}
+        assert json.loads(entry._mode({"mode": "yolo"}))["ok"] is False
+        entry._CAPTAIN = Captain(Path(tmp), capture=lambda *a: {"code": 0, "stdout": "{}", "error": ""})
+        ran = json.loads(entry._run({"agent": "t3", "prompt": "x", "mode": "drive"}))
+        bad = json.loads(entry._run({"agent": "t3", "prompt": "x", "mode": "yolo"}))
+    assert ran["run"]["follow_mode"] == "drive" and bad["ok"] is False
+
+
 def test_run_records_last_active():
     import tempfile
     import time
