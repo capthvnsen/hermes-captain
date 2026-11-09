@@ -13,6 +13,7 @@ BIN_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,40}$")
 HOST_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:@-]{0,200}$")
 ORCA_HOST_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
 EVENT_KINDS = ("done", "needs-input")
+RUN_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 LONG_GOAL = 300  # characters; a goal this long is not a small, fully specified task
 ALIASES = {
     "claudecode": "claude",
@@ -67,6 +68,31 @@ def _host_prefix(host: str | None, cwd: str | None, argv: list[str]) -> list[str
     if not host:
         return argv
     return ssh_argv(host, argv, cwd)
+
+
+TMUX_SCRIPT = r'''cwd="$1"; id="$2"; shift 2
+d="$HOME/.conductor/runs"; mkdir -p "$d"; rm -f "$d/$id.exit"; : > "$d/$id.log"
+command -v tmux >/dev/null || { echo "tmux is not installed on this host" >&2; exit 127; }
+if ! tmux has-session -t conductor 2>/dev/null; then
+  if command -v open >/dev/null; then open -na Ghostty --args -e bash -c "$(command -v tmux) new-session -d -s conductor; sleep 2"
+  else tmux new-session -d -s conductor; fi
+  for i in $(seq 1 30); do tmux has-session -t conductor 2>/dev/null && break; sleep 0.5; done
+fi
+tmux has-session -t conductor 2>/dev/null || { echo "could not start a tmux server on this host" >&2; exit 126; }
+{ echo '#!/bin/bash'; [ -n "$cwd" ] && printf 'cd %q || exit 127\n' "$cwd"; printf '%q ' "$@"; echo "> $d/$id.log 2>&1"; echo "echo \$? > $d/$id.exit"; } > "$d/$id.sh"
+tmux new-window -d -t conductor -n "cd-$id" "bash $d/$id.sh"
+tail -n +1 -f "$d/$id.log" & t=$!
+while [ ! -e "$d/$id.exit" ]; do sleep 1; done
+sleep 1; kill $t 2>/dev/null
+exit "$(cat "$d/$id.exit")"'''
+
+
+def tmux_argv(host: str, cwd: str | None, argv: list[str], run_id: str) -> list[str]:
+    """Run the agent in a tmux window on the host. The ssh call lasts as long as the window, so the existing
+    wait logic works. The window uses the host's own login session, so a CLI that cannot log in over a bare ssh still can."""
+    if not RUN_ID_RE.fullmatch(run_id or ""):
+        raise PlanError("run id is not a plain id")
+    return ssh_argv(host, ["bash", "-c", TMUX_SCRIPT, "bash", cwd or "", run_id, *argv])
 
 
 def _hook_command(agent: str, kind: str) -> list[str]:
@@ -279,6 +305,9 @@ def plan_run(
             raise PlanError("an unknown terminal agent needs prompt_flag set to -p, --print, or --prompt")
         plan = Plan("cli", [agent, flag, prompt], "background", cwd, f"{agent} print mode, no extra flags")
 
+    if host and run_id and plan.surface == "cli" and plan.mode == "background":
+        prefixed = tmux_argv(host, cwd, plan.argv, run_id)
+        return Plan(plan.surface, prefixed, plan.mode, None, plan.summary + ", in tmux on the host", agent, plan.push)
     prefixed = _host_prefix(host, cwd if host else None, plan.argv)
     local_cwd = None if host else cwd
     return Plan(plan.surface, prefixed, plan.mode, local_cwd, plan.summary, agent, plan.push)

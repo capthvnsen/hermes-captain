@@ -587,7 +587,7 @@ class Captain:
         elif record.get("log") and Path(record["log"]).exists():
             result = Path(record["log"]).read_text(encoding="utf-8", errors="replace").strip()
         said = record.get("event_message") or ""
-        if said and (record.get("event") == "needs-input" or not result):
+        if said:  # the agent's own hook captured its answer; the log also holds its warnings
             result = said
         if len(result) > MAX_RESULT:
             result = f"[first {len(result) - MAX_RESULT} characters cut]\n{result[-MAX_RESULT:]}"

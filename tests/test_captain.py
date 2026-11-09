@@ -1760,6 +1760,50 @@ def test_a_continue_never_repeats_the_plan_first_line():
     assert "One rule" not in build_prompt("add rate limiting", delta=True)
 
 
+def test_a_remote_cli_run_goes_through_tmux_and_keeps_the_exit_code():
+    from hermes_captain.plan import tmux_argv
+    plan = plan_run("claude", "fix it", host=MAC, cwd="/Users/dev/app", run_id="abc123")
+    joined = plan.argv[-1]
+    assert plan.argv[0] == "ssh" and "tmux" in joined and "abc123" in joined and "/Users/dev/app" in joined
+    assert "tmux" in plan.summary
+    for flag in ("--dangerously", "--yolo", "--trust", "bypass"):
+        assert flag not in joined
+    assert "exit \"$(cat" in joined  # the ssh call ends with the agent's own exit code
+
+
+def test_local_and_t3_runs_do_not_use_tmux():
+    assert "tmux" not in " ".join(plan_run("claude", "x", cwd="/a", run_id="abc123").argv)
+    assert "tmux" not in " ".join(plan_run("t3", "x", host=MAC, cwd="/a", run_id="abc123").argv)
+    assert "tmux" not in " ".join(plan_run("claude", "x", host=MAC, cwd="/a").argv)  # no run id: old path
+
+
+def test_tmux_refuses_a_run_id_that_is_not_plain():
+    from hermes_captain.plan import tmux_argv
+    try:
+        tmux_argv(MAC, "/a", ["claude"], "a;rm -rf /")
+    except PlanError:
+        return
+    raise AssertionError("a bad run id must be refused")
+
+
+def test_any_unknown_cli_gets_tmux_too():
+    plan = plan_run("kimi", "x", host=MAC, cwd="/a", run_id="abc123")
+    assert "tmux" in plan.argv[-1]
+    plan = plan_run("mytool", "x", host=MAC, cwd="/a", run_id="abc123", prompt_flag="-p")
+    assert "tmux" in plan.argv[-1] and "mytool" in plan.argv[-1]
+
+
+def test_the_hooks_answer_beats_a_log_full_of_warnings():
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        c = Captain(Path(tmp), capture=lambda *a: {"code": 0, "stdout": "", "error": ""})
+        log = Path(tmp) / "r.log"
+        log.write_text("WARNING noisy settings line\nthe real answer", encoding="utf-8")
+        record = {"id": "r1", "agent": "claude", "log": str(log), "event": "done", "event_message": "the real answer", "follow_mode": "advise"}
+        message = c._finish_message(record, "done")
+    assert "the real answer" in message and "noisy" not in message
+
+
 if __name__ == "__main__":
     import traceback
     failed = 0
