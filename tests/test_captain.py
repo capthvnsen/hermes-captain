@@ -1793,6 +1793,142 @@ def test_any_unknown_cli_gets_tmux_too():
     assert "tmux" in plan.argv[-1] and "mytool" in plan.argv[-1]
 
 
+def test_orca_terminal_wait_uses_the_documented_flags():
+    from hermes_captain.plan import plan_orca_read, plan_orca_wait
+    handle = "term_abc123"
+    plan = plan_orca_wait(handle, timeout_ms=60000)
+    assert plan.argv == [
+        "orca", "terminal", "wait", "--terminal", handle,
+        "--for", "tui-idle", "--timeout-ms", "60000", "--json",
+    ]
+    assert plan.mode == "capture" and "no model" in plan.summary
+    assert not any(flag in _flags(plan.argv) for flag in BANNED)
+    exited = plan_orca_wait(handle, condition="exit", timeout_ms=5000)
+    assert exited.argv[exited.argv.index("--for") + 1] == "exit"
+    assert exited.argv[exited.argv.index("--timeout-ms") + 1] == "5000"
+    read = plan_orca_read(handle)
+    assert read.argv == ["orca", "terminal", "read", "--terminal", handle, "--json"]
+    remote = plan_orca_wait(handle, timeout_ms=60000, host=MAC, environment="local")
+    assert remote.argv[0] == "ssh" and MAC in remote.argv
+    joined = remote.argv[-1]
+    for flag in ("terminal", "wait", "--terminal", handle, "--for", "tui-idle", "--timeout-ms", "60000", "--json", "--environment", "local"):
+        assert flag in joined, flag
+    try:
+        plan_orca_wait(handle, condition="chat")
+    except PlanError:
+        pass
+    else:
+        raise AssertionError("an invented wait condition was accepted")
+    try:
+        plan_orca_wait("term;rm", timeout_ms=1000)
+    except PlanError:
+        return
+    raise AssertionError("a bad terminal handle was accepted")
+
+
+def _orca_launch(kind, handle):
+    return json.dumps({"ok": True, "result": {"outcome": {"kind": kind, "handle": handle}, "receipt": {"detail": kind}}})
+
+
+def _orca_read(text):
+    return json.dumps({"ok": True, "result": {"terminal": {"handle": "term_abc123", "status": "running", "tail": [text]}}})
+
+
+def _orca_wait_json(satisfied, **extra):
+    wait = {"handle": "term_abc123", "condition": "tui-idle", "satisfied": satisfied, "status": "running", "exitCode": None}
+    wait.update(extra)
+    return {"code": 0 if satisfied else 1, "stdout": json.dumps({"ok": True, "result": {"wait": wait}}), "stderr": ""}
+
+
+def test_orca_terminal_launch_waits_with_no_model_and_reads_the_answer():
+    import tempfile
+    from hermes_captain.plan import plan_orca_read, plan_orca_wait
+    from hermes_captain.runner import ORCA_POLL_MS
+    calls = []
+    waits = iter([_orca_wait_json(False), _orca_wait_json(True)])
+
+    def capture(argv, cwd, timeout):
+        calls.append(argv)
+        if "launch" in argv:
+            return {"code": 0, "stdout": _orca_launch("terminal", "term_abc123"), "error": ""}
+        if "wait" in argv:
+            return next(waits)
+        if "read" in argv:
+            return {"code": 0, "stdout": _orca_read("Fixed the bug. 3 tests pass."), "error": ""}
+        return {"code": 0, "stdout": "", "error": ""}
+
+    sent = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        captain = Captain(root, spawn=lambda *a: (_ for _ in ()).throw(AssertionError("spawned")), capture=capture)
+        captain.notify = lambda run_id, record: sent.append(record["message"]) or True
+        record = captain.run("orca", "write the design doc", worker="codex")
+        assert record["status"] == "launched" and record["watched"] is True and record["outcome"] == "terminal"
+        done = captain.wait_done(record["id"], timeout=8)
+        saved = json.loads((root / f"{record['id']}.json").read_text())
+    assert done["model"] is False and done["ping"] == "done"
+    assert len(sent) == 1 and "finished" in sent[0] and "Fixed the bug. 3 tests pass." in sent[0]
+    assert '"ok"' not in sent[0] and "conductor_steer on run" not in sent[0]
+    waits_argv = [a for a in calls if "wait" in a]
+    assert waits_argv == [plan_orca_wait("term_abc123", timeout_ms=ORCA_POLL_MS).argv, plan_orca_wait("term_abc123", timeout_ms=ORCA_POLL_MS).argv]
+    assert [a for a in calls if "read" in a] == [plan_orca_read("term_abc123").argv]
+    assert saved["status"] == "exited"
+    assert not any(flag in _flags(a) for a in calls for flag in BANNED)
+
+
+def test_orca_blocked_terminal_is_stuck_not_finished():
+    import tempfile
+    calls = []
+
+    def capture(argv, cwd, timeout):
+        calls.append(argv)
+        if "launch" in argv:
+            return {"code": 0, "stdout": _orca_launch("terminal", "term_abc123"), "error": ""}
+        if "wait" in argv:
+            return _orca_wait_json(True, blockedReason="agent-trust-workspace")
+        if "read" in argv:
+            return {"code": 0, "stdout": _orca_read("Trust this workspace?"), "error": ""}
+        return {"code": 0, "stdout": "", "error": ""}
+
+    sent = []
+    with tempfile.TemporaryDirectory() as tmp:
+        captain = Captain(Path(tmp), spawn=lambda *a: (_ for _ in ()).throw(AssertionError("spawned")), capture=capture)
+        captain.notify = lambda run_id, record: sent.append(record["message"]) or True
+        record = captain.run("orca", "write the design doc")
+        done = captain.wait_done(record["id"], timeout=8)
+    assert done["ping"] == "needs-attention"
+    assert len(sent) == 1 and "waiting on you" in sent[0] and "finished" not in sent[0]
+    assert "Trust this workspace?" in sent[0]
+    assert len([a for a in calls if "wait" in a]) == 1
+
+
+def test_orca_chat_launch_is_not_watched_or_finished():
+    import tempfile
+    calls = []
+
+    def capture(argv, cwd, timeout):
+        calls.append(argv)
+        return {"code": 0, "stdout": _orca_launch("structured", "sess_1"), "error": ""}
+
+    sent = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        captain = Captain(root, spawn=lambda *a: (_ for _ in ()).throw(AssertionError("spawned")), capture=capture)
+        captain.notify = lambda run_id, record: sent.append(record["message"]) or True
+        record = captain.run("orca", "write the design doc", worker="claude")
+        done = captain.wait_done(record["id"], timeout=2)
+        captain.resume()
+        saved = json.loads((root / f"{record['id']}.json").read_text())
+    assert record["status"] == "launched" and record["outcome"] == "structured" and record["watched"] is False
+    assert record["handle"] == "sess_1"
+    assert "not watched" in record["summary"]
+    assert done["ping"] is None and done["ok"] is False
+    assert saved["status"] == "launched" and "ping" not in saved and "pinged_at" not in saved
+    assert sent == []
+    assert calls and calls[0][1:3] == ["agent", "launch"]
+    assert not any("wait" in a or "read" in a for a in calls)
+
+
 def test_the_hooks_answer_beats_a_log_full_of_warnings():
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:

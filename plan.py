@@ -369,6 +369,51 @@ def plan_inspect(handle: str, *, host: str | None = None) -> Plan:
     return Plan("t3", _host_prefix(host, None, argv), "capture", None, "t3code threads inspect")
 
 
+def _orca_handle(handle: str) -> str:
+    handle = (handle or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.:%-]{1,400}", handle):
+        raise PlanError("terminal handle has unexpected characters")
+    return handle
+
+
+def _orca_environment(argv: list[str], environment: str | None) -> list[str]:
+    environment = (environment or "").strip()
+    if not environment:
+        return argv
+    if not ORCA_HOST_RE.fullmatch(environment):
+        raise PlanError("orca_host is not a plain selector")
+    return [*argv, "--environment", environment]
+
+
+def plan_orca_wait(
+    handle: str,
+    *,
+    condition: str = "tui-idle",
+    timeout_ms: int = 60_000,
+    host: str | None = None,
+    environment: str | None = None,
+) -> Plan:
+    """No model. `tui-idle` is the agent CLI settling; `exit` is the process ending."""
+    if condition not in {"exit", "tui-idle"}:
+        raise PlanError("orca wait is exit or tui-idle")
+    ms = max(1, min(int(timeout_ms), 3_600_000))
+    argv = [
+        "orca", "terminal", "wait",
+        "--terminal", _orca_handle(handle),
+        "--for", condition,
+        "--timeout-ms", str(ms),
+        "--json",
+    ]
+    argv = _orca_environment(argv, environment)
+    return Plan("orca", _host_prefix(host, None, argv), "capture", None, "orca terminal wait, no model")
+
+
+def plan_orca_read(handle: str, *, host: str | None = None, environment: str | None = None) -> Plan:
+    argv = ["orca", "terminal", "read", "--terminal", _orca_handle(handle), "--json"]
+    argv = _orca_environment(argv, environment)
+    return Plan("orca", _host_prefix(host, None, argv), "capture", None, "orca terminal read")
+
+
 def plan_wait(handle: str, *, host: str | None = None, timeout: int = 600) -> Plan:
     handle = (handle or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9_.:%-]{1,400}", handle):

@@ -36,6 +36,8 @@ from .plan import (
     plan_event_wait,
     plan_inspect,
     plan_list,
+    plan_orca_read,
+    plan_orca_wait,
     plan_read,
     plan_run,
     plan_steer,
@@ -47,6 +49,7 @@ from .plan import (
 MAX_READ = 8000
 MAX_RESULT = 1500
 T3_POLL = 60  # seconds per T3 wait; the health check runs between waits
+ORCA_POLL_MS = 60_000  # one tui-idle wait; a timeout means still working, not finished
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 CARD_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 MODES = ("drive", "advise")
@@ -150,6 +153,21 @@ class Captain:
             record["status"] = "launched" if result.get("code") == 0 else "error"
             record["handle"] = _guess_handle(stdout)
             record["output"] = _clip(stdout or result.get("error") or "")
+            if plan.surface == "orca":
+                record["outcome"] = _orca_outcome(stdout)
+                environment = (kwargs.get("orca_host") or "").strip()
+                if environment:
+                    record["environment"] = environment
+                # A chat has no documented wait. Leave it launched. Do not call that finished.
+                record["watched"] = (
+                    record["status"] == "launched"
+                    and record["outcome"] == "terminal"
+                    and bool(record.get("handle"))
+                )
+                if record["outcome"] == "structured":
+                    record["summary"] = "orca chat launched, not watched"
+                elif record["watched"]:
+                    record["summary"] = "orca terminal launch, waiting with no model"
         else:
             log_path = self.data_dir / f"{run_id}.log"
             pid = self.spawn(plan.argv, plan.cwd, log_path)
@@ -163,7 +181,7 @@ class Captain:
             record["log"] = str(log_path)
         self._save(run_id, record)
         self._kanban(record, "comment", f"started: {record['agent']} {record['host'] or 'local'}")
-        if record.get("pid") or (record.get("surface") == "t3" and record.get("handle")):
+        if record.get("pid") or (record.get("surface") == "t3" and record.get("handle")) or record.get("watched"):
             self.arm_wait(run_id)
         return record
 
@@ -336,6 +354,45 @@ class Captain:
             time.sleep(self.retry_delay)
         return "wait failed"
 
+    def _wait_orca(self, record: dict) -> str:
+        """Wait on the terminal Orca opened. tui-idle is the turn settling. A block is stuck, not finished.
+        A timeout means the TUI is still busy, so keep waiting. There is no chat wait."""
+        host = record.get("host") or None
+        environment = record.get("environment") or None
+        fails = 0
+        for _ in range(4 * 3600 * 1000 // ORCA_POLL_MS):
+            try:
+                plan = plan_orca_wait(
+                    record["handle"],
+                    condition="tui-idle",
+                    timeout_ms=ORCA_POLL_MS,
+                    host=host,
+                    environment=environment,
+                )
+            except PlanError:
+                return "wait failed"
+            result = self.capture(plan.argv, None, ORCA_POLL_MS // 1000 + 20)
+            wait = _orca_wait(result.get("stdout") or "") or _orca_wait(result.get("stderr") or "")
+            if wait.get("status") == "exited" or (wait.get("satisfied") is True and not wait.get("blockedReason")):
+                code = wait.get("exitCode")
+                if isinstance(code, int) and code:
+                    saved = self._load(record["id"])
+                    saved["exit_code"] = code
+                    self._save(record["id"], saved)
+                return "done"
+            if wait.get("blockedReason"):
+                return "needs-attention"
+            if wait.get("satisfied") is False or result.get("code") in (1, 124):
+                fails = 0
+                if self._tick(record["id"]) == "errored":
+                    return "errored"
+                continue
+            fails += 1
+            if fails >= 3:
+                return "wait failed"
+            time.sleep(self.retry_delay)
+        return "wait failed"
+
     def wait_done(self, run_id: str, timeout: float = 30) -> dict:
         thread = self._waits.get(run_id)
         if thread is not None:
@@ -360,6 +417,8 @@ class Captain:
         code, event = None, None
         if record.get("surface") == "t3" and record.get("handle"):
             ping = self._wait_t3(record)
+        elif record.get("surface") == "orca" and record.get("outcome") == "terminal" and record.get("handle"):
+            ping = self._wait_orca(record)
         elif record.get("pid"):
             code, event = self._wait_pid(run_id, record["pid"])
             if event and event.get("kind") == "needs-input":
@@ -506,6 +565,8 @@ class Captain:
                 self._nudge(run_id, record)
             elif record.get("pinged_at") or run_id in self._waits:
                 continue
+            elif record.get("surface") == "orca" and record.get("outcome") != "terminal":
+                continue  # a chat launch has no wait; do not pretend it finished
             elif record.get("handle"):
                 self.arm_wait(run_id)
             elif record.get("pid"):
@@ -584,6 +645,14 @@ class Captain:
             thread = t3_thread(inspect)
             lasterr = str(thread.get("lastError") or "")
             failure = thread_failure(thread) or ("the thread run failed" if ping == "errored" else "")
+        elif record.get("surface") == "orca" and record.get("outcome") == "terminal" and record.get("handle"):
+            read = plan_orca_read(
+                record["handle"],
+                host=record.get("host") or None,
+                environment=record.get("environment") or None,
+            )
+            got = self.capture(read.argv, None, 30)
+            result = _orca_tail(got.get("stdout") or "") if got.get("code") == 0 else ""
         elif record.get("log") and Path(record["log"]).exists():
             result = Path(record["log"]).read_text(encoding="utf-8", errors="replace").strip()
         said = record.get("event_message") or ""
@@ -617,6 +686,8 @@ class Captain:
             )
         self._kanban(record, "comment", result)
         mode = record.get("follow_mode") or self.get_mode()
+        if record.get("surface") == "orca":
+            mode = "advise"  # steer is not wired for an Orca terminal
         rounds = record.get("rounds") or 0
         if mode == "advise":
             then = (
@@ -772,6 +843,48 @@ def _clip(text: str) -> str:
     if len(text) <= MAX_READ:
         return text
     return text[-MAX_READ:]
+
+
+def _orca_outcome(output: str) -> str:
+    """`terminal` or `structured` (a chat) from `orca agent launch --json`. Anything else is not watched."""
+    try:
+        data = json.loads(output or "")
+    except json.JSONDecodeError:
+        return ""
+    result = data.get("result") if isinstance(data, dict) else None
+    outcome = result.get("outcome") if isinstance(result, dict) else None
+    kind = outcome.get("kind") if isinstance(outcome, dict) else None
+    if isinstance(kind, str) and re.fullmatch(r"[a-z][a-z-]{0,40}", kind):
+        return kind
+    return ""
+
+
+def _orca_wait(stdout: str) -> dict:
+    try:
+        data = json.loads(stdout or "")
+    except json.JSONDecodeError:
+        return {}
+    result = data.get("result") if isinstance(data, dict) else None
+    wait = result.get("wait") if isinstance(result, dict) else None
+    return wait if isinstance(wait, dict) else {}
+
+
+def _orca_tail(stdout: str) -> str:
+    """Answer text from `orca terminal read --json`. The tail, never the JSON wrapper."""
+    try:
+        data = json.loads(stdout or "")
+    except json.JSONDecodeError:
+        return (stdout or "").strip()
+    result = data.get("result") if isinstance(data, dict) else None
+    terminal = result.get("terminal") if isinstance(result, dict) else None
+    if not isinstance(terminal, dict):
+        return ""
+    tail = terminal.get("tail")
+    if isinstance(tail, list):
+        return "\n".join(str(line) for line in tail if str(line).strip()).strip()
+    if isinstance(tail, str):
+        return tail.strip()
+    return ""
 
 
 def _guess_handle(output: str) -> str:
