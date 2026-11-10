@@ -1920,8 +1920,8 @@ def test_orca_spinner_is_not_treated_as_finished():
     import tempfile
     screens = iter([
         _orca_read("✢ Deciphering…"),
-        _orca_read("⏺ conductor-orca-chat\n✻ Cooked for 3s"),
-        _orca_read("⏺ conductor-orca-chat\n✻ Cooked for 3s"),
+        _orca_read("⏺ conductor-orca-chat\n✻ Churned for 2s · done\n  Opus 5.5 | ctx:5% | …"),
+        _orca_read("⏺ conductor-orca-chat\n✻ Churned for 2s · done\n  Opus 5.5 | ctx:5% | …"),
     ])
 
     def capture(argv, cwd, timeout):

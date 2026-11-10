@@ -898,18 +898,32 @@ def _missing_workspace(result: dict) -> bool:
     return result.get("code") != 0 and "selector_not_found" in text
 
 
+def _json_object(text: str) -> dict:
+    raw = text or ""
+    start = raw.find("{")
+    if start < 0:
+        return {}
+    try:
+        data = json.JSONDecoder().raw_decode(raw[start:])[0]
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _orca_still_working(text: str) -> bool:
-    """A blank screen, or a spinner line, means the turn has not settled."""
+    """A blank screen or a spinner means the turn has not settled. A truncated status bar is not a spinner."""
     raw = text or ""
     if not raw.strip():
         return True
     low = raw.lower()
-    if "cooked for" in low:
+    if "· done" in raw or "cooked for" in low:
         return False
     if "deciphering" in low or "esc to interrupt" in low:
         return True
     for line in raw.splitlines():
         stripped = line.strip()
+        if "|" in stripped:
+            continue
         if len(stripped) < 60 and (stripped.endswith("…") or stripped.endswith("...")):
             return True
     return False
@@ -917,10 +931,7 @@ def _orca_still_working(text: str) -> bool:
 
 def _orca_outcome(output: str) -> str:
     """`terminal` or `structured` (a chat) from `orca agent launch --json`. Anything else is not watched."""
-    try:
-        data = json.loads(output or "")
-    except json.JSONDecodeError:
-        return ""
+    data = _json_object(output)
     result = data.get("result") if isinstance(data, dict) else None
     outcome = result.get("outcome") if isinstance(result, dict) else None
     kind = outcome.get("kind") if isinstance(outcome, dict) else None
@@ -930,10 +941,7 @@ def _orca_outcome(output: str) -> str:
 
 
 def _orca_wait(stdout: str) -> dict:
-    try:
-        data = json.loads(stdout or "")
-    except json.JSONDecodeError:
-        return {}
+    data = _json_object(stdout)
     result = data.get("result") if isinstance(data, dict) else None
     wait = result.get("wait") if isinstance(result, dict) else None
     return wait if isinstance(wait, dict) else {}
@@ -941,9 +949,8 @@ def _orca_wait(stdout: str) -> dict:
 
 def _orca_tail(stdout: str) -> str:
     """Answer text from `orca terminal read --json`. The tail, never the JSON wrapper."""
-    try:
-        data = json.loads(stdout or "")
-    except json.JSONDecodeError:
+    data = _json_object(stdout)
+    if not data:
         return (stdout or "").strip()
     result = data.get("result") if isinstance(data, dict) else None
     terminal = result.get("terminal") if isinstance(result, dict) else None
