@@ -380,6 +380,7 @@ class Captain:
         host = record.get("host") or None
         environment = record.get("environment") or None
         fails = 0
+        settled = None
         for _ in range(4 * 3600 * 1000 // ORCA_POLL_MS):
             try:
                 plan = plan_orca_wait(
@@ -393,7 +394,7 @@ class Captain:
                 return "wait failed"
             result = self.capture(plan.argv, None, ORCA_POLL_MS // 1000 + 20)
             wait = _orca_wait(result.get("stdout") or "") or _orca_wait(result.get("stderr") or "")
-            if wait.get("status") == "exited" or (wait.get("satisfied") is True and not wait.get("blockedReason")):
+            if wait.get("status") == "exited":
                 code = wait.get("exitCode")
                 if isinstance(code, int) and code:
                     saved = self._load(record["id"])
@@ -402,6 +403,18 @@ class Captain:
                 return "done"
             if wait.get("blockedReason"):
                 return "needs-attention"
+            if wait.get("satisfied") is True:
+                # tui-idle can fire before the turn paints, and while a spinner is up.
+                screen = self._orca_screen(record)
+                if _orca_still_working(screen):
+                    settled = None
+                    fails = 0
+                    continue
+                if screen and screen == settled:
+                    return "done"
+                settled = screen
+                fails = 0
+                continue
             if wait.get("satisfied") is False or result.get("code") in (1, 124):
                 fails = 0
                 if self._tick(record["id"]) == "errored":
@@ -412,6 +425,21 @@ class Captain:
                 return "wait failed"
             time.sleep(self.retry_delay)
         return "wait failed"
+
+    def _orca_screen(self, record: dict) -> str:
+        try:
+            read = plan_orca_read(
+                record["handle"],
+                host=record.get("host") or None,
+                environment=record.get("environment") or None,
+                screen=True,
+            )
+        except PlanError:
+            return ""
+        got = self.capture(read.argv, None, 30)
+        if got.get("code") != 0:
+            return ""
+        return _orca_tail(got.get("stdout") or "")
 
     def wait_done(self, run_id: str, timeout: float = 30) -> dict:
         thread = self._waits.get(run_id)
@@ -868,6 +896,23 @@ def _clip(text: str) -> str:
 def _missing_workspace(result: dict) -> bool:
     text = f"{result.get('stdout') or ''} {result.get('error') or ''} {result.get('stderr') or ''}"
     return result.get("code") != 0 and "selector_not_found" in text
+
+
+def _orca_still_working(text: str) -> bool:
+    """A blank screen, or a spinner line, means the turn has not settled."""
+    raw = text or ""
+    if not raw.strip():
+        return True
+    low = raw.lower()
+    if "cooked for" in low:
+        return False
+    if "deciphering" in low or "esc to interrupt" in low:
+        return True
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if len(stripped) < 60 and (stripped.endswith("…") or stripped.endswith("...")):
+            return True
+    return False
 
 
 def _orca_outcome(output: str) -> str:

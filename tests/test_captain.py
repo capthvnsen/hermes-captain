@@ -1882,7 +1882,7 @@ def test_orca_terminal_launch_waits_with_no_model_and_reads_the_answer():
     from hermes_captain.plan import plan_orca_read, plan_orca_wait
     from hermes_captain.runner import ORCA_POLL_MS
     calls = []
-    waits = iter([_orca_wait_json(False), _orca_wait_json(True)])
+    waits = iter([_orca_wait_json(False), _orca_wait_json(True), _orca_wait_json(True)])
 
     def capture(argv, cwd, timeout):
         calls.append(argv)
@@ -1907,10 +1907,43 @@ def test_orca_terminal_launch_waits_with_no_model_and_reads_the_answer():
     assert len(sent) == 1 and "finished" in sent[0] and "Fixed the bug. 3 tests pass." in sent[0]
     assert '"ok"' not in sent[0] and "conductor_steer on run" not in sent[0]
     waits_argv = [a for a in calls if "wait" in a]
-    assert waits_argv == [plan_orca_wait("term_abc123", timeout_ms=ORCA_POLL_MS).argv, plan_orca_wait("term_abc123", timeout_ms=ORCA_POLL_MS).argv]
-    assert [a for a in calls if "read" in a] == [plan_orca_read("term_abc123").argv]
+    assert len(waits_argv) == 3
+    assert waits_argv[0] == plan_orca_wait("term_abc123", timeout_ms=ORCA_POLL_MS).argv
+    reads = [a for a in calls if "read" in a]
+    assert "--screen" in reads[0]
+    assert reads[-1] == plan_orca_read("term_abc123").argv
     assert saved["status"] == "exited"
     assert not any(flag in _flags(a) for a in calls for flag in BANNED)
+
+
+def test_orca_spinner_is_not_treated_as_finished():
+    import tempfile
+    screens = iter([
+        _orca_read("✢ Deciphering…"),
+        _orca_read("⏺ conductor-orca-chat\n✻ Cooked for 3s"),
+        _orca_read("⏺ conductor-orca-chat\n✻ Cooked for 3s"),
+    ])
+
+    def capture(argv, cwd, timeout):
+        if "launch" in argv:
+            return {"code": 0, "stdout": _orca_launch("terminal", "term_abc123"), "error": ""}
+        if "wait" in argv:
+            return _orca_wait_json(True)
+        if "read" in argv and "--screen" in argv:
+            return {"code": 0, "stdout": next(screens), "error": ""}
+        if "read" in argv:
+            return {"code": 0, "stdout": _orca_read("conductor-orca-chat"), "error": ""}
+        return {"code": 0, "stdout": "", "error": ""}
+
+    sent = []
+    with tempfile.TemporaryDirectory() as tmp:
+        captain = Captain(Path(tmp), spawn=lambda *a: (_ for _ in ()).throw(AssertionError("spawned")), capture=capture)
+        captain.notify = lambda run_id, record: sent.append(record["message"]) or True
+        record = captain.run("orca", "ping", worker="claude")
+        done = captain.wait_done(record["id"], timeout=8)
+    assert done["ping"] == "done"
+    assert "conductor-orca-chat" in sent[0]
+    assert "Deciphering" not in sent[0]
 
 
 def test_orca_blocked_terminal_is_stuck_not_finished():

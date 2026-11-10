@@ -431,8 +431,11 @@ def plan_orca_wait(
     return Plan("orca", _host_prefix(host, None, argv), "capture", None, "orca terminal wait, no model")
 
 
-def plan_orca_read(handle: str, *, host: str | None = None, environment: str | None = None) -> Plan:
-    argv = ["orca", "terminal", "read", "--terminal", _orca_handle(handle), "--json"]
+def plan_orca_read(handle: str, *, host: str | None = None, environment: str | None = None, screen: bool = False) -> Plan:
+    argv = ["orca", "terminal", "read", "--terminal", _orca_handle(handle)]
+    if screen:
+        argv.append("--screen")
+    argv.append("--json")
     argv = _orca_environment(argv, environment)
     return Plan("orca", _host_prefix(host, None, argv), "capture", None, "orca terminal read")
 
