@@ -36,6 +36,7 @@ from .plan import (
     plan_event_wait,
     plan_inspect,
     plan_list,
+    plan_orca_add,
     plan_orca_read,
     plan_orca_wait,
     plan_read,
@@ -149,6 +150,10 @@ class Captain:
             record["follow_mode"] = mode  # "mode" on the record is already the launch mode
         if plan.mode == "capture":
             result = self.capture(plan.argv, plan.cwd, 90)
+            if plan.surface == "orca" and "launch" in plan.argv and _missing_workspace(result):
+                added = self._register_orca_folder(kwargs.get("cwd") or "", kwargs.get("worktree") or "", kwargs.get("host"))
+                if added:
+                    result = self.capture(plan.argv, plan.cwd, 90)
             stdout = result.get("stdout") or ""
             record["status"] = "launched" if result.get("code") == 0 else "error"
             record["handle"] = _guess_handle(stdout)
@@ -184,6 +189,21 @@ class Captain:
         if record.get("pid") or (record.get("surface") == "t3" and record.get("handle")) or record.get("watched"):
             self.arm_wait(run_id)
         return record
+
+    def _register_orca_folder(self, cwd: str, worktree: str, host: str | None) -> bool:
+        """One scratch folder when Orca does not know the path. Not a git worktree."""
+        path = ""
+        selector = (worktree or "").strip()
+        if selector.startswith("path:"):
+            path = selector[5:]
+        elif (cwd or "").startswith("/"):
+            path = cwd
+        try:
+            plan = plan_orca_add(path, host=host or None)
+        except PlanError:
+            return False
+        added = self.capture(plan.argv, None, 30)
+        return added.get("code") == 0 and "selector_not_found" not in (added.get("stdout") or "")
 
     def read(self, run_id: str) -> dict:
         record = self._load(run_id)
@@ -843,6 +863,11 @@ def _clip(text: str) -> str:
     if len(text) <= MAX_READ:
         return text
     return text[-MAX_READ:]
+
+
+def _missing_workspace(result: dict) -> bool:
+    text = f"{result.get('stdout') or ''} {result.get('error') or ''} {result.get('stderr') or ''}"
+    return result.get("code") != 0 and "selector_not_found" in text
 
 
 def _orca_outcome(output: str) -> str:

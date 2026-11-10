@@ -49,7 +49,7 @@ def test_codex_exec_has_no_bypass():
 def test_orca_launch_matches_the_documented_command():
     plan = plan_run("orca", "write the design doc", worker="codex", orca_host="local")
     assert plan.argv == [
-        "orca", "agent", "launch", "--agent", "codex",
+        "orca", "agent", "launch", "--agent", "codex", "--surface", "terminal",
         "--prompt", "write the design doc", "--json", "--environment", "local",
     ]
     assert plan.mode == "capture"
@@ -1852,6 +1852,29 @@ def _orca_wait_json(satisfied, **extra):
     wait = {"handle": "term_abc123", "condition": "tui-idle", "satisfied": satisfied, "status": "running", "exitCode": None}
     wait.update(extra)
     return {"code": 0 if satisfied else 1, "stdout": json.dumps({"ok": True, "result": {"wait": wait}}), "stderr": ""}
+
+
+def test_a_missing_orca_folder_is_registered_once_then_launched():
+    import tempfile
+    calls = []
+
+    def capture(argv, cwd, timeout):
+        calls.append(argv)
+        if "launch" in argv and calls.count(argv) == 1:
+            return {"code": 1, "stdout": json.dumps({"ok": False, "error": {"code": "selector_not_found"}}), "error": "selector_not_found"}
+        if "repo" in argv and "add" in argv:
+            return {"code": 0, "stdout": json.dumps({"ok": True, "result": {"repo": {"kind": "folder"}}}), "error": ""}
+        if "launch" in argv:
+            return {"code": 0, "stdout": _orca_launch("terminal", "term_abc123"), "error": ""}
+        return {"code": 0, "stdout": "", "error": ""}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        captain = Captain(Path(tmp), spawn=lambda *a: (_ for _ in ()).throw(AssertionError("spawned")), capture=capture)
+        record = captain.run("orca", "ping", cwd="/tmp/conductor-proof", worker="claude")
+    assert record["status"] == "launched" and record["outcome"] == "terminal"
+    assert ["orca", "repo", "add", "--path", "/tmp/conductor-proof", "--kind", "folder", "--json"] in calls
+    assert sum("launch" in a for a in calls) == 2
+    assert not any(flag in _flags(a) for a in calls for flag in BANNED)
 
 
 def test_orca_terminal_launch_waits_with_no_model_and_reads_the_answer():

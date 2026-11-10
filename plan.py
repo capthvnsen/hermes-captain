@@ -264,7 +264,7 @@ def plan_run(
         which = (worker or "claude").strip()
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", which):
             raise PlanError("orca worker name is not a plain agent id")
-        argv = ["orca", "agent", "launch", "--agent", which, "--prompt", prompt, "--json"]
+        argv = ["orca", "agent", "launch", "--agent", which, "--surface", "terminal", "--prompt", prompt, "--json"]
         if worktree:
             selector = worktree.strip()
             if not re.fullmatch(r"[A-Za-z0-9_.:/@-]{1,240}", selector):
@@ -385,6 +385,27 @@ def _orca_environment(argv: list[str], environment: str | None) -> list[str]:
     if not ORCA_HOST_RE.fullmatch(environment):
         raise PlanError("orca_host is not a plain selector")
     return [*argv, "--environment", environment]
+
+
+def _safe_folder(path: str) -> bool:
+    """A scratch directory, not / or a one-segment root."""
+    if not path.startswith("/") or ".." in path.split("/"):
+        return False
+    if not re.fullmatch(r"/[A-Za-z0-9_./-]{1,200}", path):
+        return False
+    parts = [part for part in path.split("/") if part]
+    if len(parts) < 2:
+        return False
+    return path not in {"/tmp", "/private/tmp", "/Users", "/home", "/root", "/var", "/private"}
+
+
+def plan_orca_add(path: str, *, host: str | None = None) -> Plan:
+    """Register one ordinary directory. Does not create a git worktree."""
+    path = (path or "").strip()
+    if not _safe_folder(path):
+        raise PlanError("orca folder path is not a plain absolute path")
+    argv = ["orca", "repo", "add", "--path", path, "--kind", "folder", "--json"]
+    return Plan("orca", _host_prefix(host, None, argv), "capture", None, "register a scratch folder, not a client worktree")
 
 
 def plan_orca_wait(

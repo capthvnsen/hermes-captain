@@ -1,6 +1,6 @@
 name: conductor
-version: "0.8.2"
-description: "Conductor starts Claude in T3, waits with no model, then peeks. A second peek stays quiet. An Orca terminal launch is waited the same way. A chat launch is not watched. It can also lead Hermes, Claude Code, Codex, Grok Build, OpenCode, and Pycode. No approval-bypass flags."
+version: "0.8.3"
+description: "Conductor starts Claude in T3, waits with no model, then peeks. A second peek stays quiet. An Orca terminal launch is waited the same way. A missing scratch folder is registered once. A chat launch is not watched. It can also lead Hermes, Claude Code, Codex, Grok Build, OpenCode, and Pycode. No approval-bypass flags."
 author: Alex
 license: MIT
 requires_hermes: ">=0.22.0"
