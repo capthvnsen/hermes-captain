@@ -66,6 +66,20 @@ def test_t3_handover_requires_approval():
     assert plan.mode == "capture"
 
 
+def test_t3_handover_passes_a_plain_cursor_model():
+    plan = plan_run("t3", "review the diff", provider="cursor", model="grok-4.7")
+    assert plan.argv[plan.argv.index("--provider") + 1] == "cursor"
+    assert plan.argv[plan.argv.index("--model") + 1] == "grok-4.7"
+    assert plan.argv[plan.argv.index("--permission") + 1] == "approval-required"
+    assert "--model" not in plan_run("t3", "review the diff").argv
+    try:
+        plan_run("t3", "review the diff", provider="cursor", model="grok 4.7")
+    except PlanError as exc:
+        assert "plain" in str(exc)
+    else:
+        raise AssertionError("a model that is not a plain id was accepted")
+
+
 def test_remote_host_is_one_quoted_command():
     import shlex
     plan = plan_run("claude", "fix it", host="dev@203.0.113.7", cwd="/Users/dev/app")

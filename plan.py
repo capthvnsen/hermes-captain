@@ -223,8 +223,8 @@ def plan_run(
     model = (model or "").strip() or None
     if model and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,80}", model):
         raise PlanError("model must be a plain model id")
-    if model and agent not in {"hermes", "claude", "grok"}:
-        raise PlanError("model is wired for hermes, claude, and grok only")
+    if model and agent not in {"hermes", "claude", "grok", "t3", "t3code"}:
+        raise PlanError("model is wired for hermes, claude, grok, and t3 only")
 
     if agent == "hermes":
         argv = ["hermes", "chat", "-q", prompt, "-Q"]
@@ -290,6 +290,8 @@ def plan_run(
             if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", which):
                 raise PlanError("provider is not a plain id")
             argv.extend(["--provider", which])
+        if model:
+            argv.extend(["--model", model])
         plan = Plan("t3", argv, "capture", cwd, "t3code handover with approval-required, not full-access")
     elif agent == "kimi":
         plan = Plan("cli", ["kimi", "-p", prompt], "background", cwd, "kimi prompt mode, no yolo flag")
