@@ -31,6 +31,7 @@ from .peek import (
     thread_failure,
 )
 from .plan import (
+    ALIASES,
     EVENT_KINDS,
     HOST_RE,
     RECIPES,
@@ -64,6 +65,7 @@ REDELIVER_EVERY = 60  # seconds between tries at a ping Hermes did not accept
 # shortcut: claude -p prints nothing until it ends, so silence is normal; 30 minutes instead of 10 before "stalled"
 SILENT_STALL = 1800
 DOCTOR = ("hermes", "claude", "codex", "grok", "orca", "t3code", *(words[0] for words, _ in RECIPES.values()))
+NAMED_AGENTS = frozenset({"hermes", "claude", "codex", "grok", "orca", "t3", *RECIPES})
 
 
 def default_data_dir() -> Path:
@@ -81,7 +83,10 @@ class Captain:
         self._procs: dict[int, subprocess.Popen] = {}
         self._waits: dict[str, threading.Thread] = {}
         self._tried: dict[str, float] = {}  # when this process last tried to deliver a run's ping
-        self.last_peek: dict | None = None
+        self.last_peek: dict[str, dict] = {}  # per chat: a peek in one chat never rewrites a reply in another
+        # None means no limit (tests, direct use). The plugin always sets both from the owner's settings, empty by default.
+        self.allowed_hosts: set[str] | None = None
+        self.allowed_commands: set[str] | None = None
         self.notify = None
         self.retry_delay = 5
         self.health_every = 30
@@ -103,7 +108,24 @@ class Captain:
         (self.data_dir / "mode.json").write_text(json.dumps({"mode": mode}) + "\n", encoding="utf-8")
         return mode
 
+    def _check_host(self, host: str | None) -> None:
+        if host and self.allowed_hosts is not None and host not in self.allowed_hosts:
+            raise PlanError(
+                f"host {host} is not allowed. Only the owner can allow it: "
+                "add it to plugins.entries.conductor.settings.hosts in the Hermes config."
+            )
+
+    def _check_agent(self, agent: str) -> None:
+        name = ALIASES.get((agent or "").strip().lower(), (agent or "").strip().lower())
+        if name in NAMED_AGENTS or self.allowed_commands is None or name in self.allowed_commands:
+            return
+        raise PlanError(
+            f"{name or 'that'} is not an agent Conductor knows. Only the owner can allow another command: "
+            "add it to plugins.entries.conductor.settings.commands in the Hermes config."
+        )
+
     def doctor(self, host: str | None = None) -> dict:
+        self._check_host(host)
         if host:
             if not HOST_RE.fullmatch(host):
                 raise PlanError("host must be a plain SSH destination")
@@ -126,6 +148,9 @@ class Captain:
         return report
 
     def run(self, agent: str, prompt: str, **kwargs) -> dict:
+        self._check_agent(agent)
+        self._check_host(kwargs.get("host"))
+        self._check_host(kwargs.get("orca_host"))
         keep = bool(kwargs.pop("keep", False))
         session_key = str(kwargs.pop("session_key", "") or "")
         mode = kwargs.pop("mode", None)
@@ -214,7 +239,7 @@ class Captain:
             record["status"] = "running" if pid and self._running(pid) else "exited"
         return record
 
-    def peek(self, run_id: str) -> dict:
+    def peek(self, run_id: str, session: str = "") -> dict:
         record = self.read(run_id)
         output = record.get("output") or ""
         alive = record.get("status") in {"running", "launched"}
@@ -242,7 +267,7 @@ class Captain:
         record["fingerprint"] = card["fingerprint"]
         record["stuck_on_approval"] = card["stuck_on_approval"]
         self._save(run_id, record)
-        self.last_peek = {"speak": card["speak"], "run_id": run_id}
+        self.last_peek[session] = {"speak": card["speak"], "run_id": run_id}
         return card
 
     def supervise(self, interval: float = 2.0) -> bool:
@@ -296,6 +321,7 @@ class Captain:
 
     def watch_running(self, host: str | None = None, session_key: str = "") -> dict:
         """Arm a no-model wait on every running T3 thread. Ping when one finishes."""
+        self._check_host(host)
         plan = plan_list(host)
         result = self.capture(plan.argv, None, 30)
         if result.get("code") != 0:
@@ -767,8 +793,8 @@ class Captain:
             return proc.poll() is None
         return _alive(pid)
 
-    def hold_status_reply(self, reply: str) -> str | None:
-        last, self.last_peek = self.last_peek, None  # one reply only: a later answer is not a status line
+    def hold_status_reply(self, reply: str, session: str = "") -> str | None:
+        last = self.last_peek.pop(session, None)  # one reply only: a later answer is not a status line
         return hold_reply(last, reply)
 
     def steer(self, run_id: str, prompt: str) -> dict:
@@ -1010,12 +1036,44 @@ def _alive(pid: int) -> bool:
     return True
 
 
+BASE_ENV = (
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "TZ",
+    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR", "CONDUCTOR_RUN", "CONDUCTOR_EVENTS",
+)
+# What each command needs beyond the base. A name ending in * is a prefix.
+AGENT_ENV = {
+    "ssh": ("SSH_AUTH_SOCK",),
+    "hermes": ("HERMES_HOME",),
+    "claude": ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"),
+    "codex": ("OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_HOME"),
+    "grok": ("XAI_API_KEY",),
+    "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+    "qwen": ("DASHSCOPE_API_KEY",),
+    "copilot": ("GH_TOKEN", "GITHUB_TOKEN"),
+    "amp": ("AMP_API_KEY",),
+    "droid": ("FACTORY_API_KEY",),
+    "cursor-agent": ("CURSOR_API_KEY",),
+    "orca": ("ORCA_*",),
+    "t3code": ("T3CODE_*",),
+}
+
+
+def _child_env(argv: list[str]) -> dict[str, str]:
+    """A child gets the base and what its own command needs, never every key Hermes loaded."""
+    names = BASE_ENV + AGENT_ENV.get(Path(argv[0]).name if argv else "", ())
+    return {
+        key: value for key, value in os.environ.items()
+        if key in names or any(name.endswith("*") and key.startswith(name[:-1]) for name in names)
+    }
+
+
 def _spawn(argv: list[str], cwd: str | None, log_path: Path) -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "ab") as log:  # the child keeps its own copy of the handle
         proc = subprocess.Popen(
             argv,
             cwd=cwd or None,
+            env=_child_env(argv),
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -1030,6 +1088,7 @@ def _capture(argv: list[str], cwd: str | None, timeout: int) -> dict:
         done = subprocess.run(
             argv,
             cwd=cwd or None,
+            env=_child_env(argv),
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,

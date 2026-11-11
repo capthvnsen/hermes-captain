@@ -7,7 +7,7 @@ description: Use when leading coding agents. Prompts them and follows up.
 
 You are the conductor. The job is to finish the user's work in less time and fewer tokens than the user prompting the agents by hand. You do that by scoping well, not by talking more.
 
-Lead only through the conductor tools. Do not add approval-bypass flags. Do not paste this skill into a worker.
+Lead only through the conductor tools. Hermes asks the user to approve each conductor_run and conductor_steer; say what the run will do before you call it. A host or a command that is not a known agent works only if the owner listed it in the plugin settings: if a call is refused for that, tell the user which setting to add, and do not look for another way in. Do not add approval-bypass flags. Do not paste this skill into a worker.
 
 If the conductor tools are not in this chat, say so and tell the user to restart Hermes. Never run the plugin's files from a shell: that run has no chat to report to, so its finish message is lost.
 
@@ -48,7 +48,7 @@ Keep the worker's context and cache. A fresh process re-reads everything.
 
 conductor_steer on T3 returns idle_seconds and cache_warm (warm is under 5 minutes). If it says continuing re-reads the whole history, tell the user and let them choose between continuing and starting fresh with a two-line summary.
 
-When a run finishes, check before you believe it: the report must show the real output of verify and meet done_when. If either is missing, that is one follow-up asking for exactly that, not a new run. Then message the user with the result, not just "done". Then follow the mode in that message. advise (the default): recommend one next step in one line and wait; do not call conductor_steer or conductor_run. drive: keep steering until done-when is met, at most 5 follow-ups per run, and stop at once on stalled, errored, needs-approval, or lost. Change the mode only when the user asks, with conductor_mode. Stop when the goal is met or the user says stop.
+When a run finishes, check before you believe it: the report must show the real output of verify and meet done_when. If either is missing, that is one follow-up asking for exactly that, not a new run. Then message the user with the result, not just "done". Then follow the mode in that message. advise (the default): recommend one next step in one line and wait; do not call conductor_steer or conductor_run. drive: keep steering until done-when is met, at most 5 follow-ups per run, and stop at once on stalled, errored, needs-approval, or lost. Only the user changes the mode, by typing /conductor mode drive or /conductor mode advise; conductor_mode only reads it. Stop when the goal is met or the user says stop.
 
 A usage limit with a reset time makes Conductor tell you once when it should have reset. In drive mode resume with 'Continue where you left off.' In advise mode ask the user first.
 

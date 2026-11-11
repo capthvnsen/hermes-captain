@@ -43,6 +43,17 @@ plugins:
       allow_gateway_injection: true
 ```
 
+Agents on other machines, and commands that are not built-in agents, work only when you list them. Both lists are empty by default:
+
+```yaml
+plugins:
+  entries:
+    conductor:
+      settings:
+        hosts: "alex@mac, build-box"   # SSH destinations Conductor may use
+        commands: ""                   # extra agent commands, beyond the built-in ones
+```
+
 Then restart Hermes: the gateway, and the dashboard that serves the desktop app. A process that was already running does not load the plugin.
 
 ## Try it
@@ -53,13 +64,16 @@ Then restart Hermes: the gateway, and the dashboard that serves the desktop app.
 
 ## What it does on your machines
 
-- Runs commands: the coding agent you name, `git status` in the run's folder, and `ssh` and `tmux` when you give a host. Arguments only, never a shell string built from your text.
-- Approvals stay with you. An agent that needs one pings once and pings again when it finishes. Orca starts an agent with the permission mode you set in Orca.
-- Network: only `ssh` to the hosts you name. No telemetry, no update checks.
+- You approve every start and every steer. `conductor_run` and `conductor_steer` go through Hermes's approval prompt, which shows the agent, the folder, the host and the goal. Unattended runs such as cron cannot approve, so they start nothing.
+- Hermes can only launch the built-in agents, on this machine. Other SSH hosts and other commands need your `hosts` and `commands` settings above. The model cannot change them.
+- Only you can turn on drive mode, which lets Hermes keep steering a run without asking: type `/conductor mode drive`. The model can read the mode, not set it.
+- Runs commands: the coding agent, `git status` in the run's folder, and `ssh` and `tmux` for a listed host. Arguments only, never a shell string built from your text. It never adds an approval-bypass flag. Orca starts an agent with the permission mode you set in Orca.
+- Children get a minimal environment: `PATH`, `HOME`, `USER`, locale, `TERM`, Conductor's own variables, and only the variables that agent needs (for example `ANTHROPIC_API_KEY` for Claude Code, `SSH_AUTH_SOCK` for `ssh`). They do not inherit the other keys Hermes has loaded.
+- An agent that needs an approval of its own pings once and pings again when it finishes.
+- Network: only `ssh` to the hosts you listed. No telemetry, no update checks.
 - Background work: one wait thread per run inside Hermes, and a detached agent process or tmux window for a CLI run.
 - Files: run records and logs in the plugin's Hermes data folder, and event files, exit codes and logs under `~/.conductor` on the machine that runs the agent.
 - Credentials: none read or stored. Agents use their own logins.
-- It imports one private Hermes function, `gateway.session_context.bound_session_key`, to learn which chat asked, because the plugin API has no call for it. If the import fails, finish messages fall back to the session key Hermes passes to the tool.
 
 ## Tests
 

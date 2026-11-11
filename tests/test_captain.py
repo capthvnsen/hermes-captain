@@ -1172,12 +1172,15 @@ def test_mode_tool_and_slash_command():
         assert "drive or advise" in entry.handle_command("mode yolo")
         assert entry.handle_command("mode") == "Mode: drive"
         assert json.loads(entry._mode({})) == {"ok": True, "mode": "drive"}
-        assert json.loads(entry._mode({"mode": "advise"})) == {"ok": True, "mode": "advise"}
-        assert json.loads(entry._mode({"mode": "yolo"}))["ok"] is False
+        assert entry.handle_command("mode advise") == "Mode: advise"
+        # the model can read the mode, never set it: drive lets runs continue unattended
+        assert json.loads(entry._mode({"mode": "drive"})) == {"ok": True, "mode": "advise"}
+        assert entry.handle_command("mode") == "Mode: advise"
         entry._CAPTAIN = Captain(Path(tmp), capture=lambda *a: {"code": 0, "stdout": "{}", "error": ""})
         ran = json.loads(entry._run({"agent": "t3", "prompt": "x", "mode": "drive"}))
-        bad = json.loads(entry._run({"agent": "t3", "prompt": "x", "mode": "yolo"}))
-    assert ran["run"]["follow_mode"] == "drive" and bad["ok"] is False
+    assert "follow_mode" not in ran["run"]
+    assert "mode" not in entry._SCHEMAS["conductor_run"]["parameters"]["properties"]
+    assert entry._SCHEMAS["conductor_mode"]["parameters"]["properties"] == {}
 
 
 def _board(captain, fail=None, gate=None):
@@ -2131,9 +2134,10 @@ def test_a_quiet_peek_holds_one_reply_only():
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         captain = Captain(Path(tmp))
-        captain.last_peek = {"speak": False, "run_id": "abc"}
-        assert captain.hold_status_reply("Still running, nothing new.") == "No change."
-        assert captain.hold_status_reply("There is no update on the deploy yet.") is None
+        captain.last_peek["chat-a"] = {"speak": False, "run_id": "abc"}
+        assert captain.hold_status_reply("Still running, nothing new.", session="chat-b") is None  # another chat is untouched
+        assert captain.hold_status_reply("Still running, nothing new.", session="chat-a") == "No change."
+        assert captain.hold_status_reply("There is no update on the deploy yet.", session="chat-a") is None
 
 
 def test_tools_never_raise_and_a_failed_launch_is_not_ok():
@@ -2254,3 +2258,77 @@ def test_twelve_agents_at_once_each_ping_once():
     assert len({r["id"] for r in runs}) == 12
     assert sorted(sent) == sorted(r["id"] for r in runs)
     assert all(pings == ["done"] for pings in sent.values())
+
+
+def test_hosts_and_extra_commands_need_the_owners_allowlist():
+    import pytest
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        captain = Captain(Path(tmp), capture=lambda *a: {"code": 0, "stdout": "{}", "error": ""}, spawn=lambda *a: 4242)
+        captain.allowed_hosts, captain.allowed_commands = set(), set()  # what the plugin sets by default
+        for call in (
+            lambda: captain.run("node", "process.exit()", prompt_flag="-p"),
+            lambda: captain.run("python3", "http.server", prompt_flag="-m"),
+            lambda: captain.run("claude", "fix it", host="dev@box"),
+            lambda: captain.run("orca", "fix it", worker="claude", orca_host="box"),
+            lambda: captain.doctor("dev@box"),
+            lambda: captain.watch_running("dev@box"),
+        ):
+            with pytest.raises(PlanError, match="owner"):
+                call()
+        assert not list(Path(tmp).glob("*.json"))  # nothing was started
+        captain.allowed_hosts, captain.allowed_commands = {"dev@box"}, {"myagent"}
+        assert captain.run("myagent", "fix it", prompt_flag="-p")["status"] == "running"
+        assert captain.run("claude", "fix it")["status"] == "running"  # a built-in agent on this machine needs no listing
+        assert captain.doctor("dev@box")["host"] == "dev@box"
+
+
+def test_plugin_reads_allowlists_from_owner_settings_and_asks_approval():
+    entry = _entry()
+
+    class Ctx:
+        def get_config(self, key, default=None):
+            return {"hosts": "dev@box, mac", "commands": ["myagent"]}.get(key, default)
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        entry._CAPTAIN, entry._CTX = Captain(Path(tmp)), Ctx()
+        try:
+            entry._apply_settings()
+            assert entry._CAPTAIN.allowed_hosts == {"dev@box", "mac"} and entry._CAPTAIN.allowed_commands == {"myagent"}
+            entry._CTX = type("Broken", (), {"get_config": lambda self, *a: 1 / 0})()
+            entry._apply_settings()
+            assert entry._CAPTAIN.allowed_hosts == set() and entry._CAPTAIN.allowed_commands == set()
+        finally:
+            entry._CTX = None
+    run = entry._approve("conductor_run", {"agent": "claude", "cwd": "/srv/app", "host": "mac", "goal": "Fix login\nmore"})
+    assert run["action"] == "approve" and run["message"] == "claude in /srv/app on mac: Fix login" and "claude:mac:/srv/app" in run["rule_key"]
+    steer = entry._approve("conductor_steer", {"run_id": "abc", "prompt": "add a test"})
+    assert steer["action"] == "approve" and "abc" in steer["message"] and "add a test" in steer["message"]
+    assert entry._approve("conductor_peek", {"run_id": "abc"}) is None
+    assert entry._approve("terminal", {"command": "ls"}) is None
+
+
+def test_children_get_a_minimal_environment(monkeypatch):
+    from hermes_captain.runner import _child_env
+    for key, value in {"OPENAI_API_KEY": "sk-o", "ANTHROPIC_API_KEY": "sk-a", "XAI_API_KEY": "x", "TELEGRAM_BOT_TOKEN": "t",
+                       "SSH_AUTH_SOCK": "/tmp/s", "PATH": "/usr/bin", "HOME": "/home/u", "CONDUCTOR_RUN": "abc"}.items():
+        monkeypatch.setenv(key, value)
+    ssh = _child_env(["ssh", "dev@box", "true"])
+    assert ssh["PATH"] == "/usr/bin" and ssh["HOME"] == "/home/u" and ssh["CONDUCTOR_RUN"] == "abc" and ssh["SSH_AUTH_SOCK"] == "/tmp/s"
+    assert not {"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "XAI_API_KEY", "TELEGRAM_BOT_TOKEN"} & set(ssh)
+    claude = _child_env(["/opt/bin/claude", "-p", "x"])
+    assert claude["ANTHROPIC_API_KEY"] == "sk-a" and "OPENAI_API_KEY" not in claude and "TELEGRAM_BOT_TOKEN" not in claude
+    assert "OPENAI_API_KEY" in _child_env(["codex", "exec", "x"]) and "ANTHROPIC_API_KEY" not in _child_env(["codex", "exec", "x"])
+    assert not {"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "SSH_AUTH_SOCK"} & set(_child_env(["echo", "hi"]))
+
+
+def test_session_key_comes_from_the_public_hermes_call(monkeypatch):
+    import types
+    entry = _entry()
+    fake = types.ModuleType("gateway.session_context")
+    fake.get_session_env = lambda name, default="": "agent:main:telegram:dm:1" if name == "HERMES_SESSION_KEY" else default
+    monkeypatch.setitem(sys.modules, "gateway", types.ModuleType("gateway"))
+    monkeypatch.setitem(sys.modules, "gateway.session_context", fake)
+    assert entry._session({"session_key": "fallback"}) == "agent:main:telegram:dm:1"
+    assert "bound_session_key" not in (ROOT / "__init__.py").read_text()

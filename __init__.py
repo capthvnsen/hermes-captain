@@ -35,6 +35,7 @@ def _tool(fn):
     """Every tool answers with JSON and never raises into Hermes."""
     def handler(args=None, **kwargs):
         try:
+            _apply_settings()
             return json.dumps(fn(args or {}, **kwargs))
         except PlanError as exc:
             return _err(exc)
@@ -51,8 +52,8 @@ def _text(args: dict, key: str) -> str | None:
 def _session(kwargs: dict) -> str:
     """The gateway's route key for the chat that asked. A session id is not one: a ping sent to it is dropped."""
     try:
-        from gateway.session_context import bound_session_key
-        key = bound_session_key()
+        from gateway.session_context import get_session_env
+        key = get_session_env("HERMES_SESSION_KEY")
     except Exception:
         key = ""
     return key or str(kwargs.get("session_key") or "")
@@ -76,7 +77,7 @@ def _run(args, **kwargs):
     record = _captain().run(
         str(args.get("agent") or ""),
         prompt,
-        **{key: _text(args, key) for key in ("cwd", "host", "worker", "orca_host", "provider", "worktree", "prompt_flag", "model", "mode", "card")},
+        **{key: _text(args, key) for key in ("cwd", "host", "worker", "orca_host", "provider", "worktree", "prompt_flag", "model", "card")},
         continue_session=bool(args.get("continue")),
         keep=bool(args.get("keep")),
         session_key=_session(kwargs),
@@ -89,9 +90,8 @@ def _run(args, **kwargs):
 
 @_tool
 def _mode(args, **kwargs):
-    captain = _captain()
-    mode = str(args.get("mode") or "")
-    return {"ok": True, "mode": captain.set_mode(mode) if mode else captain.get_mode()}
+    del args  # read-only: drive lets runs continue unattended, so only the user turns it on, with /conductor mode drive
+    return {"ok": True, "mode": _captain().get_mode()}
 
 
 @_tool
@@ -101,7 +101,7 @@ def _read(args, **kwargs):
 
 @_tool
 def _peek(args, **kwargs):
-    return {"ok": True, "card": _captain().peek(str(args.get("run_id") or ""))}
+    return {"ok": True, "card": _captain().peek(str(args.get("run_id") or ""), session=_session(kwargs))}
 
 
 @_tool
@@ -126,6 +126,7 @@ def _watch(args, **kwargs):
 
 def handle_command(raw_args: str) -> str:
     raw = (raw_args or "").strip()
+    _apply_settings()
     if raw.split()[:1] == ["peek"]:
         run_id = raw[4:].strip()
         if not run_id:
@@ -198,17 +199,16 @@ _SCHEMAS = {
                 "keep": {"type": "boolean", "description": "When this run finishes, ping Hermes to give the next task. Only if the user still wants the work to continue."},
                 "model": {"type": "string", "description": "Plain model id for hermes, claude, grok, an Orca launch, or a T3 handover. Other agents refuse this. Not a price and not a bypass flag."},
                 "card": {"type": "string", "description": "Hermes kanban task id. Conductor comments progress on it and blocks it on an error or approval. It never completes it."},
-                "mode": {"type": "string", "enum": ["drive", "advise"], "description": "For this run only: overrides the saved mode. drive keeps steering until done; advise only recommends."},
             },
             "required": ["agent"],
         },
     },
     "conductor_mode": {
         "name": "conductor_mode",
-        "description": "Get or set what Conductor does when a run finishes and the goal is not met. drive: keep steering, at most 5 follow-ups per run. advise (default): recommend one next step and wait for the user. Only set it when the user asks.",
+        "description": "Read the follow-up mode: advise (recommend and wait) or drive (keep steering until done). Read-only. Only the user changes it, by typing /conductor mode drive or /conductor mode advise.",
         "parameters": {
             "type": "object",
-            "properties": {"mode": {"type": "string", "enum": ["drive", "advise"], "description": "Omit to read the current mode."}},
+            "properties": {},
         },
     },
     "conductor_read": {
@@ -273,8 +273,50 @@ _SCHEMAS = {
 
 
 def _hold_status(response_text: str = "", **kwargs):
+    return _captain().hold_status_reply(response_text, session=_session(kwargs))
+
+
+def _names(value) -> set[str]:
+    """An owner setting: a list, or one string with commas or spaces."""
+    items = value if isinstance(value, (list, tuple)) else str(value or "").replace(",", " ").split()
+    return {str(item).strip() for item in items if str(item).strip()}
+
+
+def _apply_settings() -> None:
+    """Hosts and extra commands come only from the owner's plugin settings. Empty by default."""
+    ctx = _CTX
+    if ctx is None:
+        return
+    captain = _captain()
+    try:
+        captain.allowed_hosts = _names(ctx.get_config("hosts", ""))
+        captain.allowed_commands = _names(ctx.get_config("commands", ""))
+    except Exception:  # unreadable settings allow nothing
+        captain.allowed_hosts, captain.allowed_commands = set(), set()
+
+
+def _approve(tool_name: str = "", args=None, **kwargs):
+    """Starting or steering an agent that edits files and runs commands goes through Hermes's approval gate."""
     del kwargs
-    return _captain().hold_status_reply(response_text)
+    args = args if isinstance(args, dict) else {}
+    if tool_name == "conductor_run":
+        agent = str(args.get("agent") or "agent")
+        where = " on ".join(part for part in (str(args.get("cwd") or "the current folder"), str(args.get("host") or "")) if part)
+        goal = str(args.get("goal") or args.get("prompt") or "").strip().splitlines()[:1]
+        return {
+            "action": "approve",
+            "message": f"{agent} in {where}: {(goal[0] if goal else '')[:200]}",
+            "rule_key": f"conductor_run:{agent}:{args.get('host') or 'local'}:{args.get('cwd') or ''}",
+        }
+    if tool_name == "conductor_steer":
+        run_id = str(args.get("run_id") or "")
+        prompt = str(args.get("prompt") or "").strip().splitlines()[:1]
+        return {
+            "action": "approve",
+            "message": f"steer run {run_id}: {(prompt[0] if prompt else '')[:200]}",
+            "rule_key": f"conductor_steer:{run_id}",
+        }
+    return None
 
 
 def _follow_up(run_id: str, record: dict) -> bool:
@@ -312,6 +354,8 @@ def register(ctx):
         args_hint="[ssh-host | peek <run_id> | mode [drive|advise]]",
     )
     ctx.register_hook("transform_llm_output", _hold_status, hold_stream=True)
+    ctx.register_hook("pre_tool_call", _approve)
+    _apply_settings()
     handlers = {
         "conductor_doctor": _doctor,
         "conductor_run": _run,

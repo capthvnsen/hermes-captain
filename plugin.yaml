@@ -1,5 +1,5 @@
 name: conductor
-version: "0.4.2"
+version: "0.4.3"
 description: "Conductor leads coding agents for Hermes: any terminal agent, T3 Code threads, and Orca terminals. It waits with no model and pings when a run finishes, errors, stalls, or needs an approval. No approval-bypass flags."
 author: Alex
 license: MIT
@@ -16,3 +16,7 @@ provides_tools:
   - conductor_watch
 provides_hooks:
   - transform_llm_output
+  - pre_tool_call
+config_schema:
+  hosts: {type: str, default: "", description: "SSH destinations Conductor may use, separated by commas or spaces. Empty means this machine only."}
+  commands: {type: str, default: "", description: "Extra commands Conductor may run as a coding agent besides the built-in agents, separated by commas or spaces. Empty means none."}
