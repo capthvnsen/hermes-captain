@@ -8,20 +8,12 @@ import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
-# How an unknown agent takes its prompt: a flag or a subcommand. Nothing here can skip an approval.
-PROMPT_FLAGS = {"-p", "--print", "--prompt", "-q", "-m", "--message", "-x", "exec", "run"}
+PROMPT_FLAGS = {"-p", "--print", "--prompt"}
 BIN_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,40}$")
 HOST_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:@-]{0,200}$")
 ORCA_HOST_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
 EVENT_KINDS = ("done", "needs-input")
 RUN_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
-HANDLE_RE = re.compile(r"[A-Za-z0-9_.:%-]{1,400}")
-LEAD = (
-    "You are the technical lead, not the coder. Split the goal into pieces that touch different files and give each piece "
-    "to a subagent with its own goal, files, and the verify command. Use the cheapest model that can do each piece and keep "
-    "the strongest for design and review. Read every diff before you accept it, and send back any piece that fails verify "
-    "or goes outside its files. If your tool has no subagents, do the pieces yourself, one at a time."
-)
 LONG_GOAL = 300  # characters; a goal this long is not a small, fully specified task
 ALIASES = {
     "claudecode": "claude",
@@ -34,25 +26,7 @@ ALIASES = {
     "opencode-ai": "opencode",
     "cursor-agent": "cursor",
     "cursoragent": "cursor",
-    "t3code": "t3",
-    "gemini-cli": "gemini",
-    "copilot-cli": "copilot",
 }
-# Headless one-shot agents: the words before the prompt, and what the run record says about them.
-RECIPES = {
-    "cursor": (["cursor-agent", "--print"], "cursor-agent print mode, no force or trust flag"),
-    "opencode": (["opencode", "run"], "opencode run, no permission bypass flag"),
-    "pycode": (["pycode", "-p"], "pycode prompt mode, confirm left on"),
-    "kimi": (["kimi", "-p"], "kimi prompt mode, no yolo flag"),
-    "pi": (["pi", "--print"], "pi print mode"),
-    "commandcode": (["commandcode", "-p"], "commandcode print mode, no trust flag"),
-    "gemini": (["gemini", "-p"], "gemini prompt mode, no yolo flag"),
-    "qwen": (["qwen", "-p"], "qwen prompt mode, no yolo flag"),
-    "copilot": (["copilot", "-p"], "copilot prompt mode, no allow-all flag"),
-    "amp": (["amp", "-x"], "amp execute mode, no allow-all flag"),
-    "droid": (["droid", "exec"], "droid exec, no skip-permissions flag"),
-}
-STEERABLE = "T3 threads and Orca terminals"
 
 
 @dataclass(frozen=True)
@@ -100,7 +74,7 @@ TMUX_SCRIPT = r'''cwd="$1"; id="$2"; shift 2
 d="$HOME/.conductor/runs"; mkdir -p "$d"; rm -f "$d/$id.exit"; : > "$d/$id.log"
 command -v tmux >/dev/null || { echo "tmux is not installed on this host" >&2; exit 127; }
 if ! tmux has-session -t conductor 2>/dev/null; then
-  if command -v open >/dev/null; then open -na Ghostty --args -e bash -c "$(command -v tmux) new-session -d -s conductor; sleep 2" 2>/dev/null || tmux new-session -d -s conductor
+  if command -v open >/dev/null; then open -na Ghostty --args -e bash -c "$(command -v tmux) new-session -d -s conductor; sleep 2"
   else tmux new-session -d -s conductor; fi
   for i in $(seq 1 30); do tmux has-session -t conductor 2>/dev/null && break; sleep 0.5; done
 fi
@@ -141,7 +115,7 @@ def codex_notify() -> str:
 
 def plan_event_wait(run_id: str, host: str, seconds: int) -> Plan:
     """One ssh command: look for the run's event file once a second, print it, delete it. Exit 6 on timeout."""
-    if not RUN_ID_RE.fullmatch(run_id or ""):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", run_id or ""):
         raise PlanError("run id is not a plain id")
     script = (
         'd="${CONDUCTOR_EVENTS:-$HOME/.conductor/events}"; i=0; while :; do '
@@ -169,7 +143,6 @@ def compose_prompt(
     skills=None,
     agent: str = "",
     delta: bool = False,
-    lead: bool = False,
 ) -> tuple[str, list[str]]:
     """The model supplies the facts. This supplies the structure and the proven habits.
     Stable text first, the changing task last, so a continued session reuses its prompt cache.
@@ -193,8 +166,6 @@ def compose_prompt(
         add("rules", "One rule: the smallest change that works. No extra features. No new dependencies.")
         add("stop", "If you are blocked or the goal is unclear, stop and say exactly what you need. Do not guess and do not widen the scope.")
         add("final_answer", "End with a final answer under 100 words: what changed, the verify output, what is left.")
-        if lead:
-            add("lead", LEAD)
         if skills and agent == "claude":
             add("skills", f"Use these skills if they are installed: {', '.join(skills)}. If pieces are independent, use parallel subagents.")
         elif skills and agent == "codex":
@@ -244,8 +215,6 @@ def plan_run(
         raise PlanError("prompt is empty")
     if len(prompt) > 100_000:
         raise PlanError("prompt is too long")
-    if prompt.startswith("-"):  # a prompt is one argument; it must never read as a flag
-        raise PlanError("a prompt cannot start with a dash")
     host = (host or "").strip() or None
     cwd = (cwd or "").strip() or None
     agent = ALIASES.get(agent, agent)
@@ -254,8 +223,8 @@ def plan_run(
     model = (model or "").strip() or None
     if model and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,80}", model):
         raise PlanError("model must be a plain model id")
-    if model and agent not in {"hermes", "claude", "grok", "t3", "orca"}:
-        raise PlanError("model is wired for hermes, claude, grok, t3, and orca only")
+    if model and agent not in {"hermes", "claude", "grok", "t3", "t3code"}:
+        raise PlanError("model is wired for hermes, claude, grok, and t3 only")
 
     if agent == "hermes":
         argv = ["hermes", "chat", "-q", prompt, "-Q"]
@@ -283,17 +252,19 @@ def plan_run(
         if model:
             argv = ["grok", "--no-auto-update", "-m", model, *argv[2:]]
         plan = Plan("cli", argv, "background", cwd, "grok headless, approvals left on")
-    elif agent in RECIPES:
-        words, summary = RECIPES[agent]
-        plan = Plan("cli", [*words, prompt], "background", cwd, summary)
+    elif agent == "cursor":
+        if prompt.startswith("-"):
+            raise PlanError("a cursor prompt cannot start with a dash")
+        plan = Plan("cli", ["cursor-agent", "--print", prompt], "background", cwd, "cursor-agent print mode, no force or trust flag")
+    elif agent == "opencode":
+        plan = Plan("cli", ["opencode", "run", prompt], "background", cwd, "opencode run, no permission bypass flag")
+    elif agent == "pycode":
+        plan = Plan("cli", ["pycode", "-p", prompt], "background", cwd, "pycode prompt mode, confirm left on")
     elif agent == "orca":
         which = (worker or "claude").strip()
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", which):
             raise PlanError("orca worker name is not a plain agent id")
-        # --surface terminal: a chat has no wait, so a chat launch could never report back
-        argv = ["orca", "agent", "launch", "--agent", which, "--prompt", prompt, "--surface", "terminal", "--json"]
-        if model:
-            argv.extend(["--model", model])
+        argv = ["orca", "agent", "launch", "--agent", which, "--surface", "terminal", "--prompt", prompt, "--json"]
         if worktree:
             selector = worktree.strip()
             if not re.fullmatch(r"[A-Za-z0-9_.:/@-]{1,240}", selector):
@@ -304,7 +275,7 @@ def plan_run(
                 raise PlanError("orca_host is not a plain selector")
             argv.extend(["--environment", orca_host])
         plan = Plan("orca", argv, "capture", cwd, "orca agent launch, json, no extra bypass flag")
-    elif agent == "t3":
+    elif agent in {"t3", "t3code"}:
         argv = [
             "t3code",
             "--json",
@@ -322,13 +293,19 @@ def plan_run(
         if model:
             argv.extend(["--model", model])
         plan = Plan("t3", argv, "capture", cwd, "t3code handover with approval-required, not full-access")
+    elif agent == "kimi":
+        plan = Plan("cli", ["kimi", "-p", prompt], "background", cwd, "kimi prompt mode, no yolo flag")
+    elif agent == "pi":
+        plan = Plan("cli", ["pi", "--print", prompt], "background", cwd, "pi print mode")
+    elif agent == "commandcode":
+        plan = Plan("cli", ["commandcode", "-p", prompt], "background", cwd, "commandcode print mode, no trust flag")
     else:
         flag = (prompt_flag or "").strip()
         if not BIN_RE.fullmatch(agent):
-            raise PlanError("agent must be a plain command name, or a named recipe such as claude, codex, orca, or t3")
+            raise PlanError("agent must be a plain command name, or hermes, claude, codex, grok, cursor, opencode, pycode, orca, or t3")
         if flag not in PROMPT_FLAGS:
-            raise PlanError(f"an unknown terminal agent needs prompt_flag set to one of: {', '.join(sorted(PROMPT_FLAGS))}")
-        plan = Plan("cli", [agent, flag, prompt], "background", cwd, f"{agent} {flag}, no extra flags")
+            raise PlanError("an unknown terminal agent needs prompt_flag set to -p, --print, or --prompt")
+        plan = Plan("cli", [agent, flag, prompt], "background", cwd, f"{agent} print mode, no extra flags")
 
     if host and run_id and plan.surface == "cli" and plan.mode == "background":
         prefixed = tmux_argv(host, cwd, plan.argv, run_id)
@@ -338,66 +315,47 @@ def plan_run(
     return Plan(plan.surface, prefixed, plan.mode, local_cwd, plan.summary, agent, plan.push)
 
 
-def _handle(handle: str) -> str:
-    handle = (handle or "").strip()
-    if not HANDLE_RE.fullmatch(handle):
-        raise PlanError("thread or terminal handle has unexpected characters")
-    return handle
-
-
-def _t3(agent: str) -> bool:
-    return (agent or "").strip().lower() in {"t3", "t3code"}
-
-
-def plan_steer(agent: str, handle: str, prompt: str, *, host: str | None = None, environment: str | None = None) -> Plan:
+def plan_steer(agent: str, handle: str, prompt: str, *, host: str | None = None) -> Plan:
     agent = (agent or "").strip().lower()
+    handle = (handle or "").strip()
     prompt = (prompt or "").strip()
-    if not (handle or "").strip() or not prompt:
+    if not handle or not prompt:
         raise PlanError("steer needs a handle and a prompt")
-    if prompt.startswith("-"):
-        raise PlanError("a prompt cannot start with a dash")
-    if agent == "orca":  # Orca itself refuses the send while the agent shows an approval menu
-        argv = ["orca", "terminal", "send", "--terminal", _handle(handle), "--text", prompt, "--enter", "--json"]
-        return Plan("orca", _host_prefix(host, None, _orca_environment(argv, environment)), "capture", None, "orca terminal send")
-    if not _t3(agent):
-        raise PlanError(f"steer is wired for {STEERABLE}; start another run with continue for a CLI agent")
+    if agent not in {"t3", "t3code"}:
+        raise PlanError("steer is wired for T3 threads; start another run for claude, codex, or orca")
+    if not re.fullmatch(r"[A-Za-z0-9_.:%-]{1,400}", handle):
+        raise PlanError("thread id has unexpected characters")
     argv = [
         "t3code", "--json", "threads", "send",
-        "--thread", _handle(handle),
+        "--thread", handle,
         "--prompt", prompt,
         "--if-busy", "steer",
     ]
     return Plan("t3", _host_prefix(host, None, argv), "capture", None, "t3code threads send --if-busy steer")
 
 
-def plan_stop(agent: str, handle: str, *, host: str | None = None, environment: str | None = None) -> Plan | None:
-    """Return a capture plan, or None when the caller should signal a process."""
+def plan_stop(agent: str, handle: str, *, host: str | None = None) -> Plan | None:
+    """Return a capture plan, or None when the caller should signal a local process."""
     agent = (agent or "").strip().lower()
-    if not (handle or "").strip():
-        return None
-    if _t3(agent):
-        argv = ["t3code", "threads", "interrupt", "--thread", _handle(handle)]
+    handle = (handle or "").strip()
+    if agent in {"t3", "t3code"} and handle:
+        if not re.fullmatch(r"[A-Za-z0-9_.:%-]{1,400}", handle):
+            raise PlanError("thread id has unexpected characters")
+        argv = ["t3code", "threads", "interrupt", "--thread", handle]
         return Plan("t3", _host_prefix(host, None, argv), "capture", None, "t3code threads interrupt")
-    if agent == "orca":  # Ctrl-C: the turn stops, the tab and its history stay
-        argv = ["orca", "terminal", "send", "--terminal", _handle(handle), "--interrupt", "--json"]
-        return Plan("orca", _host_prefix(host, None, _orca_environment(argv, environment)), "capture", None, "orca terminal interrupt")
     return None
 
 
-def plan_tmux_stop(run_id: str, host: str) -> Plan:
-    """Stop a remote CLI run: write the exit file our ssh wait is watching, then close its tmux window."""
-    if not RUN_ID_RE.fullmatch(run_id or ""):
-        raise PlanError("run id is not a plain id")
-    script = f'echo 143 > "$HOME/.conductor/runs/{run_id}.exit"; tmux kill-window -t "conductor:cd-{run_id}"'
-    return Plan("cli", ssh_argv(host, ["bash", "-c", script]), "capture", None, "tmux kill-window on the host")
-
-
 def plan_read(agent: str, handle: str, *, host: str | None = None) -> Plan | None:
-    if not _t3(agent) or not (handle or "").strip():
+    agent = (agent or "").strip().lower()
+    handle = (handle or "").strip()
+    if agent not in {"t3", "t3code"} or not handle:
         return None
+    if not re.fullmatch(r"[A-Za-z0-9_.:%-]{1,400}", handle):
+        raise PlanError("thread id has unexpected characters")
     argv = [
         "t3code", "--json", "threads", "read",
-        "--thread", _handle(handle),
+        "--thread", handle,
         "--detail", "answers",
         "--last-turn",
         "--max-chars", "8000",
@@ -406,8 +364,18 @@ def plan_read(agent: str, handle: str, *, host: str | None = None) -> Plan | Non
 
 
 def plan_inspect(handle: str, *, host: str | None = None) -> Plan:
-    argv = ["t3code", "--json", "threads", "inspect", "--thread", _handle(handle)]
+    handle = (handle or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.:%-]{1,400}", handle):
+        raise PlanError("thread id has unexpected characters")
+    argv = ["t3code", "--json", "threads", "inspect", "--thread", handle]
     return Plan("t3", _host_prefix(host, None, argv), "capture", None, "t3code threads inspect")
+
+
+def _orca_handle(handle: str) -> str:
+    handle = (handle or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.:%-]{1,400}", handle):
+        raise PlanError("terminal handle has unexpected characters")
+    return handle
 
 
 def _orca_environment(argv: list[str], environment: str | None) -> list[str]:
@@ -417,6 +385,27 @@ def _orca_environment(argv: list[str], environment: str | None) -> list[str]:
     if not ORCA_HOST_RE.fullmatch(environment):
         raise PlanError("orca_host is not a plain selector")
     return [*argv, "--environment", environment]
+
+
+def _safe_folder(path: str) -> bool:
+    """A scratch directory, not / or a one-segment root."""
+    if not path.startswith("/") or ".." in path.split("/"):
+        return False
+    if not re.fullmatch(r"/[A-Za-z0-9_./-]{1,200}", path):
+        return False
+    parts = [part for part in path.split("/") if part]
+    if len(parts) < 2:
+        return False
+    return path not in {"/tmp", "/private/tmp", "/Users", "/home", "/root", "/var", "/private"}
+
+
+def plan_orca_add(path: str, *, host: str | None = None) -> Plan:
+    """Register one ordinary directory. Does not create a git worktree."""
+    path = (path or "").strip()
+    if not _safe_folder(path):
+        raise PlanError("orca folder path is not a plain absolute path")
+    argv = ["orca", "repo", "add", "--path", path, "--kind", "folder", "--json"]
+    return Plan("orca", _host_prefix(host, None, argv), "capture", None, "register a scratch folder, not a client worktree")
 
 
 def plan_orca_wait(
@@ -433,7 +422,7 @@ def plan_orca_wait(
     ms = max(1, min(int(timeout_ms), 3_600_000))
     argv = [
         "orca", "terminal", "wait",
-        "--terminal", _handle(handle),
+        "--terminal", _orca_handle(handle),
         "--for", condition,
         "--timeout-ms", str(ms),
         "--json",
@@ -442,17 +431,23 @@ def plan_orca_wait(
     return Plan("orca", _host_prefix(host, None, argv), "capture", None, "orca terminal wait, no model")
 
 
-def plan_orca_read(handle: str, *, host: str | None = None, environment: str | None = None) -> Plan:
-    argv = ["orca", "terminal", "read", "--terminal", _handle(handle), "--json"]
+def plan_orca_read(handle: str, *, host: str | None = None, environment: str | None = None, screen: bool = False) -> Plan:
+    argv = ["orca", "terminal", "read", "--terminal", _orca_handle(handle)]
+    if screen:
+        argv.append("--screen")
+    argv.append("--json")
     argv = _orca_environment(argv, environment)
     return Plan("orca", _host_prefix(host, None, argv), "capture", None, "orca terminal read")
 
 
 def plan_wait(handle: str, *, host: str | None = None, timeout: int = 600) -> Plan:
+    handle = (handle or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.:%-]{1,400}", handle):
+        raise PlanError("thread id has unexpected characters")
     seconds = max(1, min(int(timeout), 3600))
     argv = [
         "t3code", "--json", "threads", "wait",
-        "--thread", _handle(handle),
+        "--thread", handle,
         "--timeout", str(seconds),
         "--detail", "answers",
         "--max-chars", "1500",

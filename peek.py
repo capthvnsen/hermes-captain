@@ -157,9 +157,7 @@ def idle_seconds(record: dict, thread: dict, *, use_last_active: bool = False) -
     return max(0.0, time.time() - max(seen)) if seen else None
 
 
-def run_health(
-    *, alive: bool, idle: float | None, stuck: bool = False, reason: str = "", stalled_after: float = STALLED_AFTER,
-) -> tuple[str, str]:
+def run_health(*, alive: bool, idle: float | None, stuck: bool = False, reason: str = "") -> tuple[str, str]:
     """One word and one line. working, quiet, stalled, errored, needs-approval, done."""
     if reason:
         return "errored", reason
@@ -167,7 +165,7 @@ def run_health(
         return "done", "finished"
     if stuck:
         return "needs-approval", "waiting on an approval; approve it on that machine"
-    if idle is not None and idle >= stalled_after:
+    if idle is not None and idle >= STALLED_AFTER:
         return "stalled", f"no new output for {int(idle // 60)} minutes"
     if idle is not None and idle >= QUIET_AFTER:
         return "quiet", f"no new output for {int(idle // 60)} minutes"

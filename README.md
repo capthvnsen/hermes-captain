@@ -1,10 +1,6 @@
 # Conductor
 
-Conductor starts a coding agent and waits until it finishes. Hermes gets one ping. No model sits in the wait.
-
-It works with any terminal coding agent (Claude Code, Codex, Hermes, Grok, Cursor, OpenCode, Gemini, Qwen, Copilot, Amp, Droid, Kimi, Pi, or any command with a prompt flag), with T3 Code threads, and with Orca terminals. T3 and Orca runs can be steered, and each steered turn pings again. Claude and Grok can continue their last session. It never adds an approval-bypass flag.
-
-It ships two skills. `brief` turns a brain-dump into a brief: Hermes researches what it can, asks one round of questions, and writes the goal, context, files, verify command, what to avoid, and done-when. `lead` runs the work: Hermes is the CEO, the coding agent is the CTO, and with `lead: true` that agent hands pieces to its own subagents and reviews them. Hermes checks every report against the brief before it calls the work done.
+Hermes starts a coding agent in T3 Code, Orca, or a terminal. It waits without spending model tokens and delivers the agent's answer back into the chat.
 
 ## Install
 
@@ -13,45 +9,39 @@ hermes plugins install https://github.com/capthvnsen/hermes-captain
 hermes plugins enable conductor
 ```
 
-On a messaging gateway, Hermes drops the finish message unless you allow it. In the Hermes config:
+## Tools
 
-```yaml
-plugins:
-  entries:
-    conductor:
-      allow_gateway_injection: true
+- conductor_doctor
+- conductor_run
+- conductor_mode
+- conductor_read
+- conductor_peek
+- conductor_wait
+- conductor_steer
+- conductor_stop
+- conductor_watch
+
+## Example
+
+```text
+conductor_run(agent="t3", provider="cursor", model="grok-4.7", goal="Fix the failing test")
 ```
 
-Then restart Hermes: the gateway, and the dashboard that serves the desktop app. A process that was already running does not load the plugin, and its chats will say Conductor is missing.
+## Tested live
 
-`/conductor` says so when a finish message could not be delivered.
+On 2026-11-10, Hermes on a Linux VM led agents on a Mac over SSH.
 
-## Tests
-
-```bash
-uv run --no-project --with pytest python -m pytest tests
-```
-
-## Demo
-
-1. `/conductor` shows which agents are reachable.
-2. Start a T3 run on a machine where T3 is open. Conductor waits.
-3. When it finishes, peek the run. The card shows the diff, or "No change."
-
-## What it does on your machines
-
-- Runs commands: the coding agent you name, `git status` in the run's folder, and `ssh` and `tmux` when you give a host. Arguments only, never a shell string built from your text.
-- Network: only `ssh` to the hosts you name. No telemetry, no update checks.
-- Background work: one wait thread per run inside Hermes, and a detached agent process or tmux window for a CLI run.
-- Files: run records and logs in the plugin's Hermes data folder, and event files, exit codes and logs under `~/.conductor` on the machine that runs the agent.
-- Credentials: none read or stored. Agents use their own logins.
-- It imports one private Hermes function, `gateway.session_context.bound_session_key`, to learn which chat asked, because the plugin API has no call for it. If the import fails, finish messages fall back to the session key Hermes passes to the tool.
+- T3 Code, Cursor provider, model grok-4.7: started, waited with no model, answer came back.
+- Orca terminal running Claude Code: started, waited with no model until the screen settled, answer came back.
+- Claude Code in a plain terminal over SSH (tmux on the host): answer came back.
+- Hermes CLI in a plain terminal over SSH: answer came back.
+- Kimi, Pi, and Command Code without a working login: each came back within seconds as an error carrying the agent's own message.
+- Orca chat launches are recorded as launched and not watched (Orca has no chat wait).
+- Codex and Cursor CLI were not tested live (not logged in on the test machine).
 
 ## Limits
 
-- It does not add approval-bypass flags. Orca starts the agent with the permission mode set in Orca, which may be a bypass mode.
-- An Orca result is the terminal's tail, so it carries some of the agent's screen.
-- A CLI run that asks for input pings, and pings again when it finishes. Nobody can answer a headless agent: allow the tool in that agent's own settings.
-- After a restart the exit code of a CLI run is gone, so a crash can read as a normal finish.
+- Conductor adds no approval-bypass flags. An agent's own saved settings still apply.
+- Stopping a remote terminal agent is not wired. Stopping the run here does not kill the agent on the other machine.
+- An Orca chat launch is not watched.
 - A missing login comes back as a missing login.
-- Codex over SSH needs its own login on that machine, and refuses a folder that is not a git repo.
