@@ -169,7 +169,7 @@ _SCHEMAS = {
         "parameters": {
             "type": "object",
             "properties": {
-                "host": {"type": "string", "description": "Optional SSH destination, such as alex@mac. Empty means this machine."},
+                "host": {"type": "string", "description": "Optional SSH destination, such as dev@203.0.113.7. Empty means this machine."},
             },
         },
     },
@@ -194,7 +194,7 @@ _SCHEMAS = {
                 "worker": {"type": "string", "description": "Orca only: which agent tab to launch. Defaults to claude."},
                 "orca_host": {"type": "string", "description": "Orca only: --environment selector, such as local. Empty means the machine the command runs on."},
                 "provider": {"type": "string", "description": "T3 only: provider instance id, such as claudeAgent. Empty uses T3's saved default."},
-                "worktree": {"type": "string", "description": "Orca only: worktree selector, such as path:/Users/alex/Projects/app. Required when more than one workspace matches."},
+                "worktree": {"type": "string", "description": "Orca only: worktree selector, such as path:/Users/dev/Projects/app. Required when more than one workspace matches."},
                 "continue": {"type": "boolean", "description": "Continue the last claude or grok session in this directory. Other agents refuse this."},
                 "keep": {"type": "boolean", "description": "When this run finishes, ping Hermes to give the next task. Only if the user still wants the work to continue."},
                 "model": {"type": "string", "description": "Plain model id for hermes, claude, grok, or a T3 handover (--model). Other agents refuse this. Not a price and not a bypass flag."},

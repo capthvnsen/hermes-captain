@@ -95,7 +95,7 @@ def test_remote_host_is_one_quoted_command():
 
 def test_bad_host_is_refused():
     try:
-        plan_run("claude", "fix it", host="alex@mac;rm -rf /")
+        plan_run("claude", "fix it", host="dev@203.0.113.7;rm -rf /")
     except PlanError as exc:
         assert "host" in str(exc)
     else:
@@ -1565,7 +1565,11 @@ def test_claude_gets_per_run_settings_with_only_our_two_hooks():
 def test_codex_gets_a_notify_override_for_done_only():
     import os
     import tempfile
-    import tomllib
+    import unittest
+    try:
+        import tomllib
+    except ImportError:
+        raise unittest.SkipTest("tomllib is not available before Python 3.11")
     assert plan_run("codex", "x").argv == ["codex", "exec", "x"]
     plan = plan_run("codex", "fix it", run_id="abc")
     assert plan.push == "push (done only)"
@@ -2012,16 +2016,21 @@ def test_the_hooks_answer_beats_a_log_full_of_warnings():
 
 if __name__ == "__main__":
     import traceback
+    import unittest
     failed = 0
+    skipped = 0
     tests = [value for name, value in list(globals().items()) if name.startswith("test_") and callable(value)]
     for test in tests:
         try:
             test()
             print("ok", test.__name__)
+        except unittest.SkipTest as exc:
+            skipped += 1
+            print("skip", test.__name__, exc)
         except Exception:
             failed += 1
             print("FAIL", test.__name__)
             traceback.print_exc()
     if failed:
         raise SystemExit(f"{failed} failed")
-    print(f"{len(tests)} passed")
+    print(f"{len(tests) - skipped} passed")

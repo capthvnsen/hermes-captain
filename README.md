@@ -1,8 +1,6 @@
 # Conductor
 
-Conductor starts a coding agent and waits until it finishes. Hermes gets one ping. No model sits in the wait.
-
-It starts Claude in T3, waits, and peeks. A second peek stays quiet. It can also start Hermes, Claude Code, Codex, Grok Build, OpenCode, and Pycode. Claude and Grok can continue their last session. An unknown terminal command needs `-p`, `--print`, or `--prompt`. No other flags.
+Hermes starts a coding agent in T3 Code, Orca, or a terminal. It waits without spending model tokens and delivers the agent's answer back into the chat.
 
 ## Install
 
@@ -11,19 +9,39 @@ hermes plugins install https://github.com/capthvnsen/hermes-captain
 hermes plugins enable conductor
 ```
 
-The catalog requires a public repository. This repo is private until you flip it.
+## Tools
 
-## Demo
+- conductor_doctor
+- conductor_run
+- conductor_mode
+- conductor_read
+- conductor_peek
+- conductor_wait
+- conductor_steer
+- conductor_stop
+- conductor_watch
 
-1. `/conductor` shows which agents are reachable.
-2. Start a T3 run on a machine where T3 is open. Conductor waits.
-3. When it finishes, peek the run. The card shows the diff, or "No change."
+## Example
 
-Keep the video under 90 seconds. Show the run, not a slide.
+```text
+conductor_run(agent="t3", provider="cursor", model="grok-4.7", goal="Fix the failing test")
+```
+
+## Tested live
+
+On 2026-11-10, Hermes on a Linux VM led agents on a Mac over SSH.
+
+- T3 Code, Cursor provider, model grok-4.7: started, waited with no model, answer came back.
+- Orca terminal running Claude Code: started, waited with no model until the screen settled, answer came back.
+- Claude Code in a plain terminal over SSH (tmux on the host): answer came back.
+- Hermes CLI in a plain terminal over SSH: answer came back.
+- Kimi, Pi, and Command Code without a working login: each came back within seconds as an error carrying the agent's own message.
+- Orca chat launches are recorded as launched and not watched (Orca has no chat wait).
+- Codex and Cursor CLI were not tested live (not logged in on the test machine).
 
 ## Limits
 
-- It does not add approval-bypass flags. Orca may still use its own default when it opens a tab.
-- Stopping a remote terminal agent is not wired. Stopping it here does not kill the agent on the other machine.
-- Orca has no process to wait on. Name an existing workspace or the launch fails closed.
+- Conductor adds no approval-bypass flags. An agent's own saved settings still apply.
+- Stopping a remote terminal agent is not wired. Stopping the run here does not kill the agent on the other machine.
+- An Orca chat launch is not watched.
 - A missing login comes back as a missing login.
