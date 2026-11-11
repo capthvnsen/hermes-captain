@@ -2238,3 +2238,19 @@ def test_t3_thread_is_named_after_the_goal():
     assert prompt.splitlines()[0] == "Fix the failing checkout test" and parts[0] == "title"
     assert compose_prompt("Fix it", agent="claude")[0].startswith("One rule")
     assert compose_prompt("Fix it", agent="t3", delta=True)[1][0] != "title"
+
+
+def test_twelve_agents_at_once_each_ping_once():
+    import time
+    import tempfile
+    sent = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        captain = Captain(Path(tmp))
+        captain.notify = lambda run_id, record: sent.setdefault(run_id, []).append(record["ping"]) or True
+        runs = [captain.run("echo", f"agent {i} done", prompt_flag="-q") for i in range(12)]
+        end = time.time() + 30
+        while len(sent) < 12 and time.time() < end:
+            time.sleep(0.1)
+    assert len({r["id"] for r in runs}) == 12
+    assert sorted(sent) == sorted(r["id"] for r in runs)
+    assert all(pings == ["done"] for pings in sent.values())

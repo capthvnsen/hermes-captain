@@ -2,20 +2,53 @@
 
 ![Conductor: make Hermes the CEO of your coding agents](assets/banner.png)
 
-Conductor starts a coding agent and waits until it finishes. Hermes gets one ping. No model sits in the wait.
+Conductor makes Hermes the CEO of your coding agents. You describe what you want once. Hermes fills the gaps, writes the brief, starts the agents, waits without spending a token, and comes back to you when the work is checked.
 
-It works with any terminal coding agent (Claude Code, Codex, Hermes, Grok, Cursor, OpenCode, Gemini, Qwen, Copilot, Amp, Droid, Kimi, Pi, or any command with a prompt flag), with T3 Code threads, and with Orca terminals. T3 and Orca runs can be steered, and each steered turn pings again. Claude and Grok can continue their last session. It never adds an approval-bypass flag.
+## How it works
 
-It ships two skills. `brief` turns a brain-dump into a brief: Hermes researches what it can, asks one round of questions, and writes the goal, context, files, verify command, what to avoid, and done-when. `lead` runs the work: Hermes is the CEO, the coding agent is the CTO, and with `lead: true` that agent hands pieces to its own subagents and reviews them. Hermes checks every report against the brief before it calls the work done.
+```mermaid
+flowchart TD
+    A["<b>1. You brain-dump the idea</b><br/>One message. No prompt engineering."]
+    B["<b>2. Hermes researches, then interviews you once</b><br/>Gaps are closed before an agent spends a token."]
+    C["<b>3. Hermes writes the brief</b><br/>Goal, context, files, verify, avoid, done-when.<br/>Clear prompts mean fewer wrong turns."]
+    D["<b>4. Hermes commands 10+ coding agents at once</b><br/>Pieces in different files run in parallel."]
+    D1["T3 Code"]
+    D2["Orca"]
+    D3["Claude Code"]
+    D4["Codex"]
+    D5["any terminal agent"]
+    E["<b>5. Conductor waits</b><br/>No model running. Zero tokens while it waits."]
+    F["<b>6. One ping per agent</b><br/>Done, stuck on an approval, stalled or errored:<br/>Hermes hears once, and so do you."]
+    G["<b>7. Hermes checks the work</b><br/>Against done-when and the real test output."]
+    H["<b>8. Hermes follows up</b><br/>Only what changed, to the same agent,<br/>so its context and cache are kept."]
+    I["<b>9. You get the result</b><br/>One message, when it is actually done."]
+    A --> B --> C --> D
+    D --> D1 & D2 & D3 & D4 & D5
+    D1 & D2 & D3 & D4 & D5 --> E
+    E --> F --> G
+    G -- "not done yet" --> H --> E
+    G -- "done" --> I
+```
 
-A real run, Hermes desktop on the left and the agent's T3 Code thread on the right. Hermes started the agent, said once that it needed an approval, and reported the result when the finish message arrived on its own:
+What each step is made of:
+
+- **Research and interview.** The `brief` skill has Hermes look up what it can, send a cheap read-only scout into the repo, then ask you one round of at most five questions, each with a recommended answer.
+- **The brief.** Conductor builds the kickoff from six fields and adds the habits that keep agents on track: the smallest change that works, stop and ask when blocked, a short final answer with the real verify output.
+- **Many agents.** Each run is its own agent with its own wait. Hermes starts one run per piece in the same turn; twelve at once is tested. With `lead: true` a single agent acts as CTO and hands pieces to its own subagents.
+- **The wait.** No model sits in the wait. Conductor watches the agent and puts one message into the chat that asked.
+- **The check.** The `lead` skill has Hermes compare every report with done-when before it tells you the work is done.
+- **The follow-up.** T3 Code and Orca runs are steered in place; Claude and Grok continue their last session. Hermes sends only the change, never the rules or the file list again.
+
+It works with any terminal coding agent (Claude Code, Codex, Hermes, Grok, Cursor, OpenCode, Gemini, Qwen, Copilot, Amp, Droid, Kimi, Pi, or any command with a prompt flag), with T3 Code threads, and with Orca terminals. It never adds an approval-bypass flag.
+
+A real run, Hermes desktop on the left and the agent's T3 Code thread on the right:
 
 ![A real run: the Hermes chat and the agent's thread](assets/demo-run.jpg)
 
 ## Install
 
 ```bash
-hermes plugins install https://github.com/capthvnsen/hermes-captain
+hermes plugins install https://github.com/capthvnsen/hermes-conductor
 hermes plugins enable conductor
 ```
 
@@ -28,36 +61,26 @@ plugins:
       allow_gateway_injection: true
 ```
 
-Then restart Hermes: the gateway, and the dashboard that serves the desktop app. A process that was already running does not load the plugin, and its chats will say Conductor is missing.
+Then restart Hermes: the gateway, and the dashboard that serves the desktop app. A process that was already running does not load the plugin.
 
-`/conductor` says so when a finish message could not be delivered.
+## Try it
 
-## Tests
-
-```bash
-uv run --no-project --with pytest python -m pytest tests
-```
-
-## Demo
-
-1. `/conductor` shows which agents are reachable.
-2. Start a T3 run on a machine where T3 is open. Conductor waits.
-3. When it finishes, peek the run. The card shows the diff, or "No change."
+1. `/conductor` shows which agents Hermes can reach.
+2. Tell Hermes what you want built and where. It asks what is missing, then starts the agents.
+3. Wait. Hermes messages you when an agent needs an approval and when the work is done.
 
 ## What it does on your machines
 
 - Runs commands: the coding agent you name, `git status` in the run's folder, and `ssh` and `tmux` when you give a host. Arguments only, never a shell string built from your text.
+- Approvals stay with you. An agent that needs one pings once and pings again when it finishes. Orca starts an agent with the permission mode you set in Orca.
 - Network: only `ssh` to the hosts you name. No telemetry, no update checks.
 - Background work: one wait thread per run inside Hermes, and a detached agent process or tmux window for a CLI run.
 - Files: run records and logs in the plugin's Hermes data folder, and event files, exit codes and logs under `~/.conductor` on the machine that runs the agent.
 - Credentials: none read or stored. Agents use their own logins.
 - It imports one private Hermes function, `gateway.session_context.bound_session_key`, to learn which chat asked, because the plugin API has no call for it. If the import fails, finish messages fall back to the session key Hermes passes to the tool.
 
-## Limits
+## Tests
 
-- It does not add approval-bypass flags. Orca starts the agent with the permission mode set in Orca, which may be a bypass mode.
-- An Orca result is the terminal's tail, so it carries some of the agent's screen.
-- A run that asks for input or an approval pings once, and pings again when it finishes. Nobody can answer a headless agent: allow the tool in that agent's own settings.
-- After a restart the exit code of a CLI run is gone, so a crash can read as a normal finish.
-- A missing login comes back as a missing login.
-- Codex over SSH needs its own login on that machine, and refuses a folder that is not a git repo.
+```bash
+uv run --no-project --with pytest python -m pytest tests
+```
