@@ -1,6 +1,6 @@
 name: conductor
-version: "0.8.4"
-description: "Hermes starts a coding agent in T3 Code, Orca, or a terminal. It waits without spending model tokens and delivers the agent's answer back into the chat."
+version: "0.4.2"
+description: "Conductor leads coding agents for Hermes: any terminal agent, T3 Code threads, and Orca terminals. It waits with no model and pings when a run finishes, errors, stalls, or needs an approval. No approval-bypass flags."
 author: Alex
 license: MIT
 requires_hermes: ">=0.22.0"

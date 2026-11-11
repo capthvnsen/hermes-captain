@@ -23,6 +23,7 @@ from .peek import (
     git_stat,
     hold_reply,
     idle_seconds,
+    STALLED_AFTER,
     reset_time,
     run_health,
     t3_pending,
@@ -32,17 +33,18 @@ from .peek import (
 from .plan import (
     EVENT_KINDS,
     HOST_RE,
+    RECIPES,
     PlanError,
     plan_event_wait,
     plan_inspect,
     plan_list,
-    plan_orca_add,
     plan_orca_read,
     plan_orca_wait,
     plan_read,
     plan_run,
     plan_steer,
     plan_stop,
+    plan_tmux_stop,
     plan_wait,
     ssh_argv,
 )
@@ -51,10 +53,17 @@ MAX_READ = 8000
 MAX_RESULT = 1500
 T3_POLL = 60  # seconds per T3 wait; the health check runs between waits
 ORCA_POLL_MS = 60_000  # one tui-idle wait; a timeout means still working, not finished
+# shortcut: a just-opened agent TUI is idle before it takes the prompt, so idle counts only this long after a turn starts
+ORCA_SETTLE = 20
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 CARD_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 MODES = ("drive", "advise")
 MAX_ROUNDS = 5
+GIVE_UP_AFTER = 86400
+REDELIVER_EVERY = 60  # seconds between tries at a ping Hermes did not accept
+# shortcut: claude -p prints nothing until it ends, so silence is normal; 30 minutes instead of 10 before "stalled"
+SILENT_STALL = 1800
+DOCTOR = ("hermes", "claude", "codex", "grok", "orca", "t3code", *(words[0] for words, _ in RECIPES.values()))
 
 
 def default_data_dir() -> Path:
@@ -71,6 +80,7 @@ class Captain:
         self.diff = diff or git_stat
         self._procs: dict[int, subprocess.Popen] = {}
         self._waits: dict[str, threading.Thread] = {}
+        self._tried: dict[str, float] = {}  # when this process last tried to deliver a run's ping
         self.last_peek: dict | None = None
         self.notify = None
         self.retry_delay = 5
@@ -94,18 +104,11 @@ class Captain:
         return mode
 
     def doctor(self, host: str | None = None) -> dict:
-        names = ("hermes", "claude", "codex", "grok", "opencode", "pycode", "orca", "t3code", "kimi", "pi", "commandcode")
         if host:
             if not HOST_RE.fullmatch(host):
                 raise PlanError("host must be a plain SSH destination")
-            script = (
-                'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; '
-                "for c in hermes claude codex grok opencode pycode orca t3code kimi pi commandcode; do "
-                'if command -v "$c" >/dev/null 2>&1; then echo "$c yes"; else echo "$c no"; fi; '
-                "done"
-            )
-            argv = ssh_argv(host, ["bash", "-c", script])
-            result = self.capture(argv, None, 20)
+            script = 'for c in "$@"; do if command -v "$c" >/dev/null 2>&1; then echo "$c yes"; else echo "$c no"; fi; done'
+            result = self.capture(ssh_argv(host, ["bash", "-c", script, "bash", *DOCTOR]), None, 20)
             found = {}
             for line in (result.get("stdout") or "").splitlines():
                 parts = line.split()
@@ -113,11 +116,14 @@ class Captain:
                     found[parts[0]] = parts[1] == "yes"
             return {"host": host, "ok": result.get("code") == 0, "agents": found, "error": result.get("error")}
         import shutil
-        return {
-            "host": "local",
-            "ok": True,
-            "agents": {name: shutil.which(name) is not None for name in names},
-        }
+        report = {"host": "local", "ok": True, "agents": {name: shutil.which(name) is not None for name in DOCTOR}}
+        unsent = sum(1 for record in self._records() if record.get("follow_up") == "undelivered")
+        if unsent:  # the usual cause on a gateway; without it Hermes never hears that a run finished
+            report["error"] = (
+                f"{unsent} finish message(s) could not be delivered to Hermes. "
+                "Set plugins.entries.conductor.allow_gateway_injection: true in the Hermes config."
+            )
+        return report
 
     def run(self, agent: str, prompt: str, **kwargs) -> dict:
         keep = bool(kwargs.pop("keep", False))
@@ -141,6 +147,7 @@ class Captain:
             "keep": keep,
             "last_active": time.time(),
             "events": plan.push,
+            "owner": os.getpid(),
         }
         if session_key:
             record["session_key"] = session_key
@@ -150,14 +157,11 @@ class Captain:
             record["follow_mode"] = mode  # "mode" on the record is already the launch mode
         if plan.mode == "capture":
             result = self.capture(plan.argv, plan.cwd, 90)
-            if plan.surface == "orca" and "launch" in plan.argv and _missing_workspace(result):
-                added = self._register_orca_folder(kwargs.get("cwd") or "", kwargs.get("worktree") or "", kwargs.get("host"))
-                if added:
-                    result = self.capture(plan.argv, plan.cwd, 90)
             stdout = result.get("stdout") or ""
             record["status"] = "launched" if result.get("code") == 0 else "error"
             record["handle"] = _guess_handle(stdout)
-            record["output"] = _clip(stdout or result.get("error") or "")
+            # the launch reply is a large JSON wrapper: keep it out of the model's context unless it is the error
+            record["output"] = "" if result.get("code") == 0 else _clip(result.get("error") or stdout)
             if plan.surface == "orca":
                 record["outcome"] = _orca_outcome(stdout)
                 environment = (kwargs.get("orca_host") or "").strip()
@@ -169,8 +173,8 @@ class Captain:
                     and record["outcome"] == "terminal"
                     and bool(record.get("handle"))
                 )
-                if record["outcome"] == "structured":
-                    record["summary"] = "orca chat launched, not watched"
+                if record["status"] == "launched" and not record["watched"]:
+                    record["summary"] = "orca launch is not watched: it did not open a terminal"
                 elif record["watched"]:
                     record["summary"] = "orca terminal launch, waiting with no model"
         else:
@@ -190,29 +194,17 @@ class Captain:
             self.arm_wait(run_id)
         return record
 
-    def _register_orca_folder(self, cwd: str, worktree: str, host: str | None) -> bool:
-        """One scratch folder when Orca does not know the path. Not a git worktree."""
-        path = ""
-        selector = (worktree or "").strip()
-        if selector.startswith("path:"):
-            path = selector[5:]
-        elif (cwd or "").startswith("/"):
-            path = cwd
-        try:
-            plan = plan_orca_add(path, host=host or None)
-        except PlanError:
-            return False
-        added = self.capture(plan.argv, None, 30)
-        return added.get("code") == 0 and "selector_not_found" not in (added.get("stdout") or "")
-
     def read(self, run_id: str) -> dict:
         record = self._load(run_id)
         if record.get("surface") == "t3" and record.get("handle"):
             plan = plan_read(record.get("agent") or "t3", record["handle"], host=record.get("host") or None)
             if plan is not None:
                 result = self.capture(plan.argv, None, 30)
-                record["output"] = _clip(result.get("stdout") or result.get("error") or "")
-                record["status"] = "launched" if result.get("code") == 0 else "error"
+                if result.get("code") == 0:  # the answer, never the JSON wrapper: it is 10x the tokens and changes every read
+                    record["output"] = _clip(_answer_text(result.get("stdout") or ""))
+                else:
+                    record["output"] = _clip(result.get("error") or "")
+                    record["status"] = "error"
                 self._save(run_id, record)
                 return record
         log = record.get("log")
@@ -292,6 +284,9 @@ class Captain:
         record = self._load(run_id)
         if record.get("pinged_at"):
             return {"ok": True, "ping": record.get("ping"), "seconds": 0, "model": False}
+        thread = self._waits.get(run_id)
+        if thread is not None and thread.is_alive():  # a second wait would ping twice
+            return {"ok": True, "waiting": True, "model": False}
         record["wait_started"] = time.time()
         self._save(run_id, record)
         thread = threading.Thread(target=self._wait_loop, args=(run_id,), daemon=True)
@@ -338,27 +333,36 @@ class Captain:
         return {"ok": True, "watched": watched, "model": False}
 
     def _open_handles(self) -> set[str]:
-        handles = set()
-        for path in self.data_dir.glob("*.json"):
+        return {r["handle"] for r in self._records() if r.get("handle") and not r.get("pinged_at")}
+
+    def _records(self) -> list[dict]:
+        records = []
+        for path in sorted(self.data_dir.glob("*.json")):
             try:
                 record = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
-            if record.get("handle") and not record.get("pinged_at"):
-                handles.add(record["handle"])
-        return handles
+            if isinstance(record, dict) and RUN_ID_RE.fullmatch(str(record.get("id") or "")):
+                records.append(record)
+        return records
 
     def _wait_t3(self, record: dict) -> str:
         host = record.get("host") or None
         fails = 0
-        for _ in range(4 * 3600 // T3_POLL):
+        deadline = time.time() + 4 * 3600
+        while time.time() < deadline:
             plan = plan_wait(record["handle"], host=host, timeout=T3_POLL)
             result = self.capture(plan.argv, None, T3_POLL + 20)
             outcome = _wait_outcome(result.get("stdout") or "") or _wait_outcome(result.get("stderr") or "")
             if outcome == "completed":
                 return "done"
             if outcome == "needs-attention":
-                return "needs-attention"
+                if record.get("ping") != "needs-attention":
+                    return "needs-attention"
+                time.sleep(self.retry_delay)  # Hermes was told once: wait quietly for the approval, the finish is still owed
+                continue
+            if outcome in ("error", "interrupted"):
+                return "errored"
             if outcome == "timeout" or result.get("code") in (6, 124):
                 fails = 0
                 if self._tick(record["id"]) == "errored":
@@ -380,7 +384,6 @@ class Captain:
         host = record.get("host") or None
         environment = record.get("environment") or None
         fails = 0
-        settled = None
         for _ in range(4 * 3600 * 1000 // ORCA_POLL_MS):
             try:
                 plan = plan_orca_wait(
@@ -394,7 +397,11 @@ class Captain:
                 return "wait failed"
             result = self.capture(plan.argv, None, ORCA_POLL_MS // 1000 + 20)
             wait = _orca_wait(result.get("stdout") or "") or _orca_wait(result.get("stderr") or "")
-            if wait.get("status") == "exited":
+            idle = wait.get("satisfied") is True and not wait.get("blockedReason")
+            if idle and wait.get("status") != "exited" and time.time() - (self._load(record["id"]).get("last_active") or 0) < ORCA_SETTLE:
+                time.sleep(self.retry_delay)
+                continue
+            if wait.get("status") == "exited" or idle:
                 code = wait.get("exitCode")
                 if isinstance(code, int) and code:
                     saved = self._load(record["id"])
@@ -403,19 +410,8 @@ class Captain:
                 return "done"
             if wait.get("blockedReason"):
                 return "needs-attention"
-            if wait.get("satisfied") is True:
-                # tui-idle can fire before the turn paints, and while a spinner is up.
-                screen = self._orca_screen(record)
-                if _orca_still_working(screen):
-                    settled = None
-                    fails = 0
-                    continue
-                if screen and screen == settled:
-                    return "done"
-                settled = screen
-                fails = 0
-                continue
-            if wait.get("satisfied") is False or result.get("code") in (1, 124):
+            # exit 1 is also a stale handle or a closed Orca: only a timeout means still working
+            if wait.get("satisfied") is False or result.get("code") == 124 or "timeout" in (_orca_error(result.get("stdout") or ""), _orca_error(result.get("stderr") or "")):
                 fails = 0
                 if self._tick(record["id"]) == "errored":
                     return "errored"
@@ -425,21 +421,6 @@ class Captain:
                 return "wait failed"
             time.sleep(self.retry_delay)
         return "wait failed"
-
-    def _orca_screen(self, record: dict) -> str:
-        try:
-            read = plan_orca_read(
-                record["handle"],
-                host=record.get("host") or None,
-                environment=record.get("environment") or None,
-                screen=True,
-            )
-        except PlanError:
-            return ""
-        got = self.capture(read.argv, None, 30)
-        if got.get("code") != 0:
-            return ""
-        return _orca_tail(got.get("stdout") or "")
 
     def wait_done(self, run_id: str, timeout: float = 30) -> dict:
         thread = self._waits.get(run_id)
@@ -458,9 +439,16 @@ class Captain:
 
     def _wait_loop(self, run_id: str) -> None:
         try:
-            record = self._load(run_id)
+            while self._wait_once(run_id):
+                pass
         except PlanError:
-            return
+            return  # the record is gone
+        except Exception:
+            logger.exception("conductor wait %s", run_id)  # supervise() arms it again
+
+    def _wait_once(self, run_id: str) -> bool:
+        """One wait and one ping. True when the agent asked for input but is still running: its finish is still owed."""
+        record = self._load(run_id)
         ping = "done"
         code, event = None, None
         if record.get("surface") == "t3" and record.get("handle"):
@@ -473,21 +461,22 @@ class Captain:
                 ping = "needs-attention"
         else:
             ping = "no process to wait on"
-        try:
-            fresh = self._load(run_id)
-        except PlanError:
-            return
+        fresh = self._load(run_id)
         if code and fresh.get("status") != "stopped":  # our own SIGTERM is not a crash
             fresh["exit_code"] = code
         if event:
             fresh["event"] = event["kind"]
             fresh["event_message"] = str(event.get("message") or "")[-MAX_RESULT:]
-        fresh["status"] = "exited" if ping in ("done", "errored") else fresh.get("status")
+        if ping in ("done", "errored") and fresh.get("status") != "stopped":
+            fresh["status"] = "exited"
         fresh["ping"] = ping
         fresh["pinged_at"] = fresh["last_active"] = time.time()
         fresh["message"] = self._finish_message(fresh, ping)
         self._save(run_id, fresh)
         self._deliver(run_id, fresh)
+        if ping != "needs-attention":
+            return False
+        return bool(record.get("surface") == "t3" and record.get("handle")) or bool(record.get("pid") and self._running(record["pid"]))
 
     def _wait_pid(self, run_id: str, pid: int) -> tuple[int | None, dict | None]:
         """Block until the process exits or the agent's own hook reports, checking health on the way.
@@ -555,7 +544,10 @@ class Captain:
             alive = state not in ("idle", "completed") or stuck
         if not alive and not reason:
             reason = error_reason(record.get("exit_code"), output)
-        return run_health(alive=alive, idle=idle_seconds(record, thread), stuck=stuck, reason=reason)
+        return run_health(
+            alive=alive, idle=idle_seconds(record, thread), stuck=stuck, reason=reason,
+            stalled_after=SILENT_STALL if record.get("events") == "push" else STALLED_AFTER,
+        )
 
     def _tick(self, run_id: str) -> str:
         """One no-model health check inside the wait. Pings once per stall or approval."""
@@ -595,23 +587,24 @@ class Captain:
         except Exception:
             sent = False
         record["follow_up"] = "delivered" if sent else "undelivered"
+        self._tried[run_id] = time.time()
         self._save(run_id, record)
 
     def resume(self) -> None:
         """After a restart: re-send missed messages and re-arm T3 waits."""
-        for path in sorted(self.data_dir.glob("*.json")):
-            try:
-                record = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            run_id = record.get("id") or ""
-            if not RUN_ID_RE.fullmatch(run_id):
-                continue
+        for record in self._records():
+            run_id = record["id"]
+            owner = record.get("owner")
+            if owner and owner != os.getpid() and _alive(owner):
+                continue  # the process that started it is still up: it waits and it pings, we would only ping twice
             if record.get("follow_up") == "undelivered" and record.get("message"):
-                self._deliver(run_id, record)
+                if time.time() - (record.get("pinged_at") or time.time()) > GIVE_UP_AFTER:
+                    continue  # a day-old ping has no chat left to reach; retrying only fills the log
+                if time.time() - self._tried.get(run_id, 0) >= REDELIVER_EVERY:
+                    self._deliver(run_id, record)
             elif record.get("resume_at") and not record.get("resumed_at") and time.time() >= record["resume_at"]:
                 self._nudge(run_id, record)
-            elif record.get("pinged_at") or run_id in self._waits:
+            elif record.get("pinged_at") or (run_id in self._waits and self._waits[run_id].is_alive()):
                 continue
             elif record.get("surface") == "orca" and record.get("outcome") != "terminal":
                 continue  # a chat launch has no wait; do not pretend it finished
@@ -681,6 +674,8 @@ class Captain:
                 f"Conductor: lost track of {name}{where} ({ping}). It may still be running. "
                 f"Tell the user this now. Check it once with conductor_peek {run_id}. Do not start another run."
             )
+        if record.get("status") == "stopped":
+            return f"Conductor: {name}{where} was stopped (run {run_id}). Tell the user in one line. Do not start another run unless the user says so."
         result, pending, failure, lasterr = "", False, "", ""
         if record.get("surface") == "t3" and record.get("handle"):
             host = record.get("host") or None
@@ -734,8 +729,6 @@ class Captain:
             )
         self._kanban(record, "comment", result)
         mode = record.get("follow_mode") or self.get_mode()
-        if record.get("surface") == "orca":
-            mode = "advise"  # steer is not wired for an Orca terminal
         rounds = record.get("rounds") or 0
         if mode == "advise":
             then = (
@@ -775,38 +768,60 @@ class Captain:
         return _alive(pid)
 
     def hold_status_reply(self, reply: str) -> str | None:
-        return hold_reply(self.last_peek, reply)
+        last, self.last_peek = self.last_peek, None  # one reply only: a later answer is not a status line
+        return hold_reply(last, reply)
 
     def steer(self, run_id: str, prompt: str) -> dict:
         record = self._load(run_id)
-        plan = plan_steer(record.get("agent") or "", record.get("handle") or "", prompt, host=record.get("host") or None)
-        probe = self.capture(plan_inspect(record["handle"], host=record.get("host") or None).argv, None, 20)
-        if probe.get("code") != 0:
-            return {"ok": False, "output": "could not check for a pending approval, so nothing was sent"}
-        if t3_pending(probe.get("stdout") or ""):
-            return {"ok": False, "output": "stuck on an approval; approve it on that machine first. Nothing was sent"}
-        thread = t3_thread(probe.get("stdout") or "")
-        policy = cache_policy(idle_seconds(record, thread, use_last_active=True), thread)
+        host = record.get("host") or None
+        plan = plan_steer(
+            record.get("agent") or "", record.get("handle") or "", prompt,
+            host=host, environment=record.get("environment") or None,
+        )
+        policy = {}
+        if plan.surface == "t3":
+            probe = self.capture(plan_inspect(record["handle"], host=host).argv, None, 20)
+            if probe.get("code") != 0:
+                return {"ok": False, "output": "could not check for a pending approval, so nothing was sent"}
+            if t3_pending(probe.get("stdout") or ""):
+                return {"ok": False, "output": "stuck on an approval; approve it on that machine first. Nothing was sent"}
+            thread = t3_thread(probe.get("stdout") or "")
+            policy = cache_policy(idle_seconds(record, thread, use_last_active=True), thread)
+        elif not record.get("watched"):
+            return {"ok": False, "output": "this Orca launch has no terminal to send to. Nothing was sent"}
         result = self.capture(plan.argv, None, 60)
-        if result.get("code") == 0:
+        ok = result.get("code") == 0
+        if ok:
+            record = self._load(run_id)
             record["last_active"] = time.time()
             record["rounds"] = (record.get("rounds") or 0) + 1
+            waiting = self._waits.get(run_id)
+            if not (waiting is not None and waiting.is_alive()):
+                # the last turn already pinged; this new turn must report back too
+                for key in ("pinged_at", "ping", "follow_up", "message", "alerted", "resume_at", "resumed_at"):
+                    record.pop(key, None)
+                record["status"] = "launched"
             self._save(run_id, record)
-        return {"ok": result.get("code") == 0, "output": _clip(result.get("stdout") or result.get("error") or ""), **policy}
+            self.arm_wait(run_id)
+        return {"ok": ok, "output": "sent" if ok else _clip(result.get("error") or result.get("stdout") or ""), **policy}
 
     def stop(self, run_id: str) -> dict:
         record = self._load(run_id)
-        remote = plan_stop(record.get("agent") or "", record.get("handle") or "", host=record.get("host") or None)
-        if record.get("host") and remote is None:
-            return {"ok": False, "output": "remote stop is not wired; the agent on the other machine keeps running"}
+        host = record.get("host") or None
+        pid = record.get("pid")
+        remote = plan_stop(record.get("agent") or "", record.get("handle") or "", host=host, environment=record.get("environment") or None)
+        if remote is None and host and pid:
+            remote = plan_tmux_stop(run_id, host)
         if remote is not None:
             result = self.capture(remote.argv, None, 30)
-            record["status"] = "stopped" if result.get("code") == 0 else "error"
-            self._save(run_id, record)
-            return {"ok": result.get("code") == 0, "output": _clip(result.get("stdout") or "")}
-        pid = record.get("pid")
-        if not pid:
-            return {"ok": False, "output": "no local process to stop"}
+            ok = result.get("code") == 0
+            if ok:  # a stop that did not land (the turn had already ended) changes nothing
+                record = self._load(run_id)
+                record["status"] = "stopped"
+                self._save(run_id, record)
+            return {"ok": ok, "output": "stopped" if ok else _clip(result.get("error") or result.get("stdout") or "")}
+        if not pid or host:
+            return {"ok": False, "output": "nothing to stop: this run has no process, thread, or terminal"}
         try:
             os.killpg(int(pid), signal.SIGTERM)
         except ProcessLookupError:
@@ -823,7 +838,10 @@ class Captain:
         return self.data_dir / f"{run_id}.json"
 
     def _save(self, run_id: str, record: dict) -> None:
-        self._path(run_id).write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+        path = self._path(run_id)  # write beside it, then swap: a reader never sees half a record
+        tmp = path.with_name(f"{run_id}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
 
     def _load(self, run_id: str) -> dict:
         path = self._path(run_id)
@@ -893,45 +911,12 @@ def _clip(text: str) -> str:
     return text[-MAX_READ:]
 
 
-def _missing_workspace(result: dict) -> bool:
-    text = f"{result.get('stdout') or ''} {result.get('error') or ''} {result.get('stderr') or ''}"
-    return result.get("code") != 0 and "selector_not_found" in text
-
-
-def _json_object(text: str) -> dict:
-    raw = text or ""
-    start = raw.find("{")
-    if start < 0:
-        return {}
-    try:
-        data = json.JSONDecoder().raw_decode(raw[start:])[0]
-    except json.JSONDecodeError:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _orca_still_working(text: str) -> bool:
-    """A blank screen or a spinner means the turn has not settled. A truncated status bar is not a spinner."""
-    raw = text or ""
-    if not raw.strip():
-        return True
-    low = raw.lower()
-    if "· done" in raw or "cooked for" in low:
-        return False
-    if "deciphering" in low or "esc to interrupt" in low:
-        return True
-    for line in raw.splitlines():
-        stripped = line.strip()
-        if "|" in stripped:
-            continue
-        if len(stripped) < 60 and (stripped.endswith("…") or stripped.endswith("...")):
-            return True
-    return False
-
-
 def _orca_outcome(output: str) -> str:
     """`terminal` or `structured` (a chat) from `orca agent launch --json`. Anything else is not watched."""
-    data = _json_object(output)
+    try:
+        data = json.loads(output or "")
+    except json.JSONDecodeError:
+        return ""
     result = data.get("result") if isinstance(data, dict) else None
     outcome = result.get("outcome") if isinstance(result, dict) else None
     kind = outcome.get("kind") if isinstance(outcome, dict) else None
@@ -941,16 +926,29 @@ def _orca_outcome(output: str) -> str:
 
 
 def _orca_wait(stdout: str) -> dict:
-    data = _json_object(stdout)
+    try:
+        data = json.loads(stdout or "")
+    except json.JSONDecodeError:
+        return {}
     result = data.get("result") if isinstance(data, dict) else None
     wait = result.get("wait") if isinstance(result, dict) else None
     return wait if isinstance(wait, dict) else {}
 
 
+def _orca_error(stdout: str) -> str:
+    try:
+        data = json.loads(stdout or "")
+    except json.JSONDecodeError:
+        return ""
+    error = data.get("error") if isinstance(data, dict) else None
+    return str(error.get("code") or "") if isinstance(error, dict) else ""
+
+
 def _orca_tail(stdout: str) -> str:
     """Answer text from `orca terminal read --json`. The tail, never the JSON wrapper."""
-    data = _json_object(stdout)
-    if not data:
+    try:
+        data = json.loads(stdout or "")
+    except json.JSONDecodeError:
         return (stdout or "").strip()
     result = data.get("result") if isinstance(data, dict) else None
     terminal = result.get("terminal") if isinstance(result, dict) else None
@@ -1014,15 +1012,15 @@ def _alive(pid: int) -> bool:
 
 def _spawn(argv: list[str], cwd: str | None, log_path: Path) -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log = open(log_path, "ab")
-    proc = subprocess.Popen(
-        argv,
-        cwd=cwd or None,
-        stdin=subprocess.DEVNULL,
-        stdout=log,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
+    with open(log_path, "ab") as log:  # the child keeps its own copy of the handle
+        proc = subprocess.Popen(
+            argv,
+            cwd=cwd or None,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
     _spawn._last = proc  # type: ignore[attr-defined]
     return proc.pid
 
@@ -1042,6 +1040,8 @@ def _capture(argv: list[str], cwd: str | None, timeout: int) -> dict:
         return {"code": 124, "stdout": exc.stdout or "", "error": "timed out"}
     except FileNotFoundError as exc:
         return {"code": 127, "stdout": "", "error": f"not found: {exc.filename}"}
+    except OSError as exc:
+        return {"code": 126, "stdout": "", "error": str(exc)}
     stdout = done.stdout or ""
     if isinstance(stdout, bytes):
         stdout = stdout.decode("utf-8", errors="replace")
