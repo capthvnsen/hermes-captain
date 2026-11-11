@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.log
+.harness-test/
+.test-doctor/
+.live-test/
+.wait-live/
+
