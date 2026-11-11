@@ -173,7 +173,7 @@ _SCHEMAS = {
     },
     "conductor_run": {
         "name": "conductor_run",
-        "description": "Start a coding agent and get one ping when it finishes, errors, stalls, or needs an approval. Do not poll. Any terminal agent works: named recipes, or a command name plus prompt_flag. orca and t3 open it in the user's app, where it can also be steered. Never adds approval-bypass flags.",
+        "description": "Start a coding agent and get one ping when it finishes, errors, stalls, or needs an approval. Before the first run of a new project or an unclear goal, follow the brief skill: research, then ask the user one round of questions. Work with several independent pieces gets one run per piece, all started in the same turn, not one agent for everything. Do not poll. Any terminal agent works: named recipes, or a command name plus prompt_flag. orca and t3 open it in the user's app, where it can also be steered. Never adds approval-bypass flags.",
         "parameters": {
             "type": "object",
             "properties": {

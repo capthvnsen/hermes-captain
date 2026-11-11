@@ -34,4 +34,4 @@ If the work has several pieces, list them under the brief: one outcome each, wit
 
 ## 5. Hand it off
 
-Use the lead skill. One piece: one conductor_run. Several pieces: one conductor_run with lead true on the strongest agent, so it runs the team, or separate runs for pieces in different files. Pass the six fields as fields, not as prose in prompt: Conductor builds the kickoff and keeps it cache-friendly.
+Use the lead skill. Count the pieces first. Pieces that touch different files each get their own conductor_run, all started in the same turn: twelve pieces is twelve runs at once, and each pings on its own. One agent doing twelve pieces in a row is slower and one stall blocks them all. Use a single run only for one piece, or with lead true when the pieces share files and need one agent to coordinate them. Pass the six fields as fields, not as prose in prompt: Conductor builds the kickoff and keeps it cache-friendly.

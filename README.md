@@ -6,29 +6,7 @@ Conductor makes Hermes the CEO of your coding agents. You describe what you want
 
 ## How it works
 
-```mermaid
-flowchart TD
-    A["<b>1. You brain-dump the idea</b><br/>One message. No prompt engineering."]
-    B["<b>2. Hermes researches, then interviews you once</b><br/>Gaps are closed before an agent spends a token."]
-    C["<b>3. Hermes writes the brief</b><br/>Goal, context, files, verify, avoid, done-when.<br/>Clear prompts mean fewer wrong turns."]
-    D["<b>4. Hermes commands 10+ coding agents at once</b><br/>Pieces in different files run in parallel."]
-    D1["T3 Code"]
-    D2["Orca"]
-    D3["Claude Code"]
-    D4["Codex"]
-    D5["any terminal agent"]
-    E["<b>5. Conductor waits</b><br/>No model running. Zero tokens while it waits."]
-    F["<b>6. One ping per agent</b><br/>Done, stuck on an approval, stalled or errored:<br/>Hermes hears once, and so do you."]
-    G["<b>7. Hermes checks the work</b><br/>Against done-when and the real test output."]
-    H["<b>8. Hermes follows up</b><br/>Only what changed, to the same agent,<br/>so its context and cache are kept."]
-    I["<b>9. You get the result</b><br/>One message, when it is actually done."]
-    A --> B --> C --> D
-    D --> D1 & D2 & D3 & D4 & D5
-    D1 & D2 & D3 & D4 & D5 --> E
-    E --> F --> G
-    G -- "not done yet" --> H --> E
-    G -- "done" --> I
-```
+![How a run goes: brain-dump, research and questions, the brief, 10+ agents at once, a zero-token wait, one ping per agent, the check and the follow-up](assets/workflow.jpg)
 
 What each step is made of:
 
@@ -41,9 +19,13 @@ What each step is made of:
 
 It works with any terminal coding agent (Claude Code, Codex, Hermes, Grok, Cursor, OpenCode, Gemini, Qwen, Copilot, Amp, Droid, Kimi, Pi, or any command with a prompt flag), with T3 Code threads, and with Orca terminals. It never adds an approval-bypass flag.
 
-A real run, Hermes desktop on the left and the agent's T3 Code thread on the right:
+A real run. One message asked Hermes to finish a half-built habit tracker. Hermes read the repo, started twelve agents in T3 Code, one per feature, and reported when all twelve had pinged back and the 24 tests passed:
 
-![A real run: the Hermes chat and the agent's thread](assets/demo-run.jpg)
+![A real run: the Hermes chat on the left, twelve agent threads in T3 Code on the right](assets/demo-run.jpg)
+
+The app those twelve agents finished:
+
+![The finished habit tracker](assets/demo-app.png)
 
 ## Install
 
