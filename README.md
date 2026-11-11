@@ -39,9 +39,16 @@ On 2026-11-10, Hermes on a Linux VM led agents on a Mac over SSH.
 - Orca chat launches are recorded as launched and not watched (Orca has no chat wait).
 - Codex and Cursor CLI were not tested live (not logged in on the test machine).
 
+## What it runs
+
+- Shell commands: the agent CLI you name (`claude`, `codex`, `hermes`, `t3code`, `orca`, and others), plus `ssh` and `tmux` when a host is set. Commands are built as argument lists, never through a shell string on this machine.
+- Background work: one waiting thread per run, in the Hermes process. It runs no model. It stops when the agent finishes. T3 and Orca waits also give up after four hours.
+- Files: run records under the plugin's own data directory. On the machine the agent runs on, Conductor writes run logs and finish events under `~/.conductor/`, and a remote terminal run opens a window in a tmux session named `conductor`. For a Claude or Codex run, a per-run hook setting is passed on the command line; your global agent config is not edited.
+- Network: only the `ssh` connection to the host you name. No third-party calls, no telemetry, no stored credentials.
+
 ## Limits
 
 - Conductor adds no approval-bypass flags. An agent's own saved settings still apply.
-- Stopping a remote terminal agent is not wired. Stopping the run here does not kill the agent on the other machine.
+- Stop works for a local process and for a T3 thread. Stopping a remote terminal or Orca run is not wired; that agent keeps running on the other machine.
 - An Orca chat launch is not watched.
 - A missing login comes back as a missing login.
