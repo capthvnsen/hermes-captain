@@ -1574,7 +1574,10 @@ def test_claude_gets_per_run_settings_with_only_our_two_hooks():
 def test_codex_gets_a_notify_override_for_done_only():
     import os
     import tempfile
-    import tomllib
+    try:
+        import tomllib
+    except ImportError:  # Python before 3.11 has no tomllib
+        return
     assert plan_run("codex", "x").argv == ["codex", "exec", "x"]
     plan = plan_run("codex", "fix it", run_id="abc")
     assert plan.push == "push (done only)"
@@ -1963,24 +1966,6 @@ def test_the_hooks_answer_beats_a_log_full_of_warnings():
     assert "the real answer" in message and "noisy" not in message
 
 
-if __name__ == "__main__":
-    import traceback
-    failed = 0
-    tests = [value for name, value in list(globals().items()) if name.startswith("test_") and callable(value)]
-    for test in tests:
-        try:
-            test()
-            print("ok", test.__name__)
-        except Exception:
-            failed += 1
-            print("FAIL", test.__name__)
-            traceback.print_exc()
-    if failed:
-        raise SystemExit(f"{failed} failed")
-    print(f"{len(tests)} passed")
-
-
-
 def test_a_steered_turn_is_watched_again_and_pings_when_it_finishes():
     """Without this a drive follow-up went out and its result never came back."""
     import tempfile
@@ -2260,8 +2245,16 @@ def test_twelve_agents_at_once_each_ping_once():
     assert all(pings == ["done"] for pings in sent.values())
 
 
+def _owner_refuses(call):
+    try:
+        call()
+    except PlanError as exc:
+        assert "owner" in str(exc)
+        return
+    raise AssertionError("was not refused")
+
+
 def test_hosts_and_extra_commands_need_the_owners_allowlist():
-    import pytest
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         captain = Captain(Path(tmp), capture=lambda *a: {"code": 0, "stdout": "{}", "error": ""}, spawn=lambda *a: 4242)
@@ -2274,8 +2267,7 @@ def test_hosts_and_extra_commands_need_the_owners_allowlist():
             lambda: captain.doctor("dev@box"),
             lambda: captain.watch_running("dev@box"),
         ):
-            with pytest.raises(PlanError, match="owner"):
-                call()
+            _owner_refuses(call)
         assert not list(Path(tmp).glob("*.json"))  # nothing was started
         captain.allowed_hosts, captain.allowed_commands = {"dev@box"}, {"myagent"}
         assert captain.run("myagent", "fix it", prompt_flag="-p")["status"] == "running"
@@ -2332,3 +2324,131 @@ def test_session_key_comes_from_the_public_hermes_call(monkeypatch):
     monkeypatch.setitem(sys.modules, "gateway.session_context", fake)
     assert entry._session({"session_key": "fallback"}) == "agent:main:telegram:dm:1"
     assert "bound_session_key" not in (ROOT / "__init__.py").read_text()
+
+
+def test_a_saved_run_on_an_unlisted_host_is_not_reached():
+    """read, peek, wait, steer, stop and the restart resume take a run id, not a host: the list applies to them too."""
+    import tempfile
+    calls = []
+
+    def capture(argv, cwd, timeout):
+        calls.append(argv)
+        return {"code": 0, "stdout": "{}", "stderr": "", "error": ""}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        captain = Captain(Path(tmp), capture=capture)
+        base = {"status": "launched", "last_active": 0, "cwd": "/srv/app"}
+        captain._save("t3run", {**base, "id": "t3run", "agent": "t3", "surface": "t3", "handle": "th_1", "host": "old@box"})
+        captain._save("orcarun", {**base, "id": "orcarun", "agent": "orca", "surface": "orca", "outcome": "terminal",
+                                  "handle": "term_1", "watched": True, "environment": "oldbox"})
+        captain._save("clirun", {**base, "id": "clirun", "agent": "claude", "surface": "cli", "pid": 4242, "host": "old@box"})
+        captain.allowed_hosts = set()
+        for run_id in ("t3run", "orcarun", "clirun"):
+            for call in (captain.read, captain.peek, captain.arm_wait, captain.stop, lambda r: captain.steer(r, "go on")):
+                _owner_refuses(lambda: call(run_id))
+        captain.resume()  # a restart does not reach them either, and does not stop at the first one
+        assert calls == [] and not captain._waits
+        captain.allowed_hosts = {"old@box"}
+        assert captain.read("t3run")["id"] == "t3run" and calls and calls[0][0] == "ssh"
+
+
+def test_settings_are_applied_before_the_first_resume():
+    entry = _entry()
+    seen = []
+
+    class Ctx:
+        def get_config(self, key, default=None):
+            return default
+
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: None
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        captain = Captain(Path(tmp))
+        captain.resume = lambda: seen.append(captain.allowed_hosts)
+        entry._CAPTAIN = captain
+        try:
+            entry.register(Ctx())
+        finally:
+            captain._supervise_stop.set()
+            entry._CTX = None
+    assert seen and all(hosts == set() for hosts in seen)
+
+
+def test_the_approval_prompt_names_the_orca_machine():
+    ask = _entry()._approve("conductor_run", {"agent": "orca", "cwd": "/srv/app", "orca_host": "buildbox", "goal": "Fix login"})
+    assert ask["message"] == "orca in /srv/app on buildbox: Fix login" and "orca:buildbox:/srv/app" in ask["rule_key"]
+
+
+def test_every_subprocess_gets_the_minimal_environment(monkeypatch):
+    import ast
+    import os
+    import subprocess
+    import tempfile
+    from hermes_captain.peek import git_status
+    from hermes_captain.runner import _child_env, _proc_start
+    for path in ROOT.glob("*.py"):  # no call may inherit what Hermes loaded
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Call) and ast.unparse(node.func) in ("subprocess.run", "subprocess.Popen", "subprocess.check_output"):
+                assert any(k.arg == "env" for k in node.keywords), f"{path.name}:{node.lineno} has no env="
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-o")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-a")
+    envs = []
+    real = subprocess.run
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: envs.append((argv[0], kw.get("env"))) or real(argv, **kw))
+    with tempfile.TemporaryDirectory() as tmp:
+        git_status(tmp)
+    _proc_start(os.getpid())
+    assert [name for name, _ in envs] == ["git", "ps"]
+    assert all(env is not None and "PATH" in env and not {"OPENAI_API_KEY", "ANTHROPIC_API_KEY"} & set(env) for _, env in envs)
+    # the real launch puts `env CONDUCTOR_RUN=id` first: the agent behind it still gets its own key, and only its own
+    claude = _child_env(plan_run("claude", "fix it", run_id="abc").argv)
+    codex = _child_env(plan_run("codex", "fix it", run_id="abc").argv)
+    assert claude["ANTHROPIC_API_KEY"] == "sk-a" and "OPENAI_API_KEY" not in claude
+    assert codex["OPENAI_API_KEY"] == "sk-o" and "ANTHROPIC_API_KEY" not in codex
+
+
+if __name__ == "__main__":  # last in the file, so it runs every test above
+    import inspect
+    import os
+    import traceback
+    from unittest import mock
+
+    class MonkeyPatch:  # the three calls the tests use, so this file runs without pytest
+        def __init__(self):
+            self._patches = []
+
+        def _start(self, patch):
+            self._patches.append(patch)
+            patch.start()
+
+        def setenv(self, key, value):
+            self._start(mock.patch.dict(os.environ, {key: value}))
+
+        def setitem(self, mapping, key, value):
+            self._start(mock.patch.dict(mapping, {key: value}))
+
+        def setattr(self, target, name, value):
+            self._start(mock.patch.object(target, name, value))
+
+        def undo(self):
+            while self._patches:
+                self._patches.pop().stop()
+
+    failed = 0
+    tests = [value for name, value in list(globals().items()) if name.startswith("test_") and callable(value)]
+    for test in tests:
+        patch = MonkeyPatch()
+        try:
+            test(patch) if "monkeypatch" in inspect.signature(test).parameters else test()
+            print("ok", test.__name__)
+        except Exception:
+            failed += 1
+            print("FAIL", test.__name__)
+            traceback.print_exc()
+        finally:
+            patch.undo()
+    if failed:
+        raise SystemExit(f"{failed} failed")
+    print(f"{len(tests)} passed")

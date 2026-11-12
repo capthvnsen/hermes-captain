@@ -64,10 +64,10 @@ Then restart Hermes: the gateway, and the dashboard that serves the desktop app.
 
 ## What it does on your machines
 
-- You approve every start and every steer. `conductor_run` and `conductor_steer` go through Hermes's approval prompt, which shows the agent, the folder, the host and the goal. Unattended runs such as cron cannot approve, so they start nothing.
-- Hermes can only launch the built-in agents, on this machine. Other SSH hosts and other commands need your `hosts` and `commands` settings above. The model cannot change them.
+- Every start and every steer asks you first. `conductor_run` and `conductor_steer` go through Hermes's approval prompt, which shows the agent, the folder, the host and the goal. If you answer "session" or "always", Hermes stops asking for that agent in that folder on that host, or for that run. Unattended runs such as cron have nobody to approve, so they start nothing, unless you turned Hermes's own approvals off (`approvals.cron_mode: approve`, `approvals.mode: off`, or yolo).
+- Hermes can only launch the built-in agents, on this machine. Other SSH hosts and other commands need your `hosts` and `commands` settings above. The list is checked again on every read, wait, steer and stop of a saved run. Conductor gives the model no tool that changes it.
 - Only you can turn on drive mode, which lets Hermes keep steering a run without asking: type `/conductor mode drive`. The model can read the mode, not set it.
-- Runs commands: the coding agent, `git status` in the run's folder, and `ssh` and `tmux` for a listed host. Arguments only, never a shell string built from your text. It never adds an approval-bypass flag. Orca starts an agent with the permission mode you set in Orca.
+- Runs commands: the coding agent, `git status` in the run's folder, `ps` for a run's own process, `hermes kanban` when you pass a card, and `ssh` and `tmux` for a listed host. Arguments only, never a shell string built from your text. It never adds an approval-bypass flag. Orca starts an agent with the permission mode you set in Orca.
 - Children get a minimal environment: `PATH`, `HOME`, `USER`, locale, `TERM`, Conductor's own variables, and only the variables that agent needs (for example `ANTHROPIC_API_KEY` for Claude Code, `SSH_AUTH_SOCK` for `ssh`). They do not inherit the other keys Hermes has loaded.
 - An agent that needs an approval of its own pings once and pings again when it finishes.
 - Network: only `ssh` to the hosts you listed. No telemetry, no update checks.
@@ -79,4 +79,5 @@ Then restart Hermes: the gateway, and the dashboard that serves the desktop app.
 
 ```bash
 uv run --no-project --with pytest python -m pytest tests
+python3 tests/test_captain.py   # the same tests, without pytest
 ```

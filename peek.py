@@ -51,8 +51,9 @@ def _run_git(argv: list[str]) -> str:
         return ""
     if not Path(argv[2]).is_dir():
         return ""
+    from .runner import _child_env  # here, not at the top: runner imports this module
     try:
-        done = subprocess.run(argv, capture_output=True, text=True, timeout=8, check=False)
+        done = subprocess.run(argv, env=_child_env(argv), capture_output=True, text=True, timeout=8, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return ""
     return (done.stdout or "").strip()[:500]

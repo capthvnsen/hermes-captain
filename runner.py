@@ -634,6 +634,8 @@ class Captain:
                 continue
             elif record.get("surface") == "orca" and record.get("outcome") != "terminal":
                 continue  # a chat launch has no wait; do not pretend it finished
+            elif self.allowed_hosts is not None and {record.get("host"), record.get("environment")} - {None, ""} - self.allowed_hosts:
+                continue  # its host is no longer on the owner's list: do not reach it
             elif record.get("handle"):
                 self.arm_wait(run_id)
             elif record.get("pid"):
@@ -873,7 +875,11 @@ class Captain:
         path = self._path(run_id)
         if not path.exists():
             raise PlanError(f"no run {run_id}")
-        return json.loads(path.read_text(encoding="utf-8"))
+        record = json.loads(path.read_text(encoding="utf-8"))
+        # a saved run reaches its host on read, peek, wait, steer and stop: the owner's list applies to those too
+        self._check_host(record.get("host"))
+        self._check_host(record.get("environment"))
+        return record
 
 
 def _check_mode(mode: str) -> str:
@@ -1020,7 +1026,10 @@ def _guess_handle(output: str) -> str:
 def _proc_start(pid: int) -> str:
     """Start time of a pid. Same pid with a different start time is a different process."""
     try:
-        done = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))], capture_output=True, text=True, timeout=5, check=False)
+        done = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(int(pid))], env=_child_env(["ps"]),
+            capture_output=True, text=True, timeout=5, check=False,
+        )
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return ""
     return (done.stdout or "").strip()
@@ -1060,7 +1069,10 @@ AGENT_ENV = {
 
 def _child_env(argv: list[str]) -> dict[str, str]:
     """A child gets the base and what its own command needs, never every key Hermes loaded."""
-    names = BASE_ENV + AGENT_ENV.get(Path(argv[0]).name if argv else "", ())
+    words = list(argv)
+    if words[:1] == ["env"]:  # `env CONDUCTOR_RUN=id claude ...`: the agent is the word after the assignments
+        words = [word for word in words[1:] if "=" not in word][:1]
+    names = BASE_ENV + AGENT_ENV.get(Path(words[0]).name if words else "", ())
     return {
         key: value for key, value in os.environ.items()
         if key in names or any(name.endswith("*") and key.startswith(name[:-1]) for name in names)

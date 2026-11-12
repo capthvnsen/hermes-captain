@@ -301,12 +301,13 @@ def _approve(tool_name: str = "", args=None, **kwargs):
     args = args if isinstance(args, dict) else {}
     if tool_name == "conductor_run":
         agent = str(args.get("agent") or "agent")
-        where = " on ".join(part for part in (str(args.get("cwd") or "the current folder"), str(args.get("host") or "")) if part)
+        host = " ".join(str(args.get(key)) for key in ("host", "orca_host") if args.get(key))  # both are other machines
+        where = " on ".join(part for part in (str(args.get("cwd") or "the current folder"), host) if part)
         goal = str(args.get("goal") or args.get("prompt") or "").strip().splitlines()[:1]
         return {
             "action": "approve",
             "message": f"{agent} in {where}: {(goal[0] if goal else '')[:200]}",
-            "rule_key": f"conductor_run:{agent}:{args.get('host') or 'local'}:{args.get('cwd') or ''}",
+            "rule_key": f"conductor_run:{agent}:{host or 'local'}:{args.get('cwd') or ''}",
         }
     if tool_name == "conductor_steer":
         run_id = str(args.get("run_id") or "")
@@ -335,6 +336,7 @@ def register(ctx):
     global _CTX
     _CTX = ctx
     _captain().notify = _follow_up
+    _apply_settings()  # before the first resume: a saved run on a host the owner has not listed is not reached
     _captain().supervise()
     _captain().resume()
     ctx.register_skill(
@@ -355,7 +357,6 @@ def register(ctx):
     )
     ctx.register_hook("transform_llm_output", _hold_status, hold_stream=True)
     ctx.register_hook("pre_tool_call", _approve)
-    _apply_settings()
     handlers = {
         "conductor_doctor": _doctor,
         "conductor_run": _run,
